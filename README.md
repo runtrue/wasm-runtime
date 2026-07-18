@@ -56,3 +56,16 @@ cargo test --all-targets
 Wasmtime 46's WASI 0.3 module is still labeled experimental by its embedding
 API. The runtime pins the exact release and keeps those types behind this
 crate's stable surface.
+
+## Tier benchmark
+
+Run the same standard no-op command through all preparation tiers. The first
+argument selects WASI and the second is the sample count:
+
+```text
+cargo run --release --example tier_benchmark -- 0.3 100 > wasi-0.3.json
+cargo run --release --example tier_benchmark -- 0.2 100 > wasi-0.2.json
+```
+
+The JSON includes every raw sample plus p50 and p95 runtime initialization,
+preparation, instantiation, execution, call-total, and harness-total timings.
