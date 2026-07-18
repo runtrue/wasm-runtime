@@ -5,6 +5,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors returned by the runtime.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Runtime configuration was invalid.
     #[error("invalid runtime configuration: {0}")]

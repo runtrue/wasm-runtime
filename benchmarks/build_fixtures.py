@@ -25,6 +25,31 @@ def run(*arguments: str) -> None:
 def main() -> None:
     if not ADAPTER.is_file():
         raise SystemExit("run `uv run benchmarks/bootstrap_tools.py` first")
+    oversized_source = ROOT / "tests/fixtures/oversized_output.rs"
+    oversized_output = ROOT / "tests/fixtures/oversized-output.component.wasm"
+    run(
+        "rustc",
+        "--edition=2024",
+        "--crate-name",
+        "oversized_output",
+        "--target",
+        "wasm32-wasip2",
+        "-C",
+        "opt-level=z",
+        "-C",
+        "lto=fat",
+        "-C",
+        "panic=abort",
+        "-C",
+        "strip=debuginfo",
+        str(oversized_source),
+        "-o",
+        str(oversized_output),
+    )
+    print(
+        f"{oversized_output.relative_to(ROOT)} "
+        f"sha256={hashlib.sha256(oversized_output.read_bytes()).hexdigest()}"
+    )
     for package, artifact in FIXTURES.items():
         manifest = ROOT / f"benchmarks/fixtures/{package}/Cargo.toml"
         run(

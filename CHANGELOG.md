@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-07-18
+
+### Added
+
+- Failure-containment, cache-operations, package-consumer, and fuzz release
+  gates for untrusted components and authenticated native artifacts.
+- Alert-first performance regression collection with raw host metadata and a
+  stable-runner enforcement path.
+- Public API stability and production OS-isolation guidance.
+
+### Changed
+
+- Public state and error enums are non-exhaustive so new standards versions
+  and lifecycle states can be added compatibly.
+
 ## [0.1.0-alpha.3] - 2026-07-18
 
 ### Added
@@ -21,5 +36,6 @@ All notable changes to this project are documented here. The format follows
 - Direct-handler, TCP, capacity, cache eviction, timeout, and concurrent
   service benchmarks and tests.
 
-[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.3...HEAD
+[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.4...HEAD
+[0.1.0-alpha.4]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/runtrue/wasm-runtime/releases/tag/v0.1.0-alpha.3

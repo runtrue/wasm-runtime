@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 /// Standard WASI command generation implemented by a component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WasiVersion {
     /// WASI 0.3 `wasi:cli/command`, using native Component Model async.
     V0_3,
@@ -22,6 +23,7 @@ pub enum WasiVersion {
 /// Standard WASI world implemented by a component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WasiProfile {
     /// WASI 0.3 command world.
     Cli0_3,
@@ -70,6 +72,7 @@ impl WasiProfile {
 /// Package preparation state observed before an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum PackageTier {
     /// Only source component bytes are available.
     Cold,
@@ -84,6 +87,7 @@ pub enum PackageTier {
 /// Lifecycle state of a spawned command invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum InvocationState {
     /// The invocation is eligible to make progress.
     Running,
@@ -158,6 +162,7 @@ impl CommandInput {
 
 /// Output from a standard WASI command invocation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CommandOutput {
     /// Captured standard output bytes.
     pub stdout: Vec<u8>,

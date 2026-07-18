@@ -1,0 +1,116 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      enforce:
+        description: Fail when a metric exceeds its alert threshold
+        required: true
+        default: false
+        type: boolean
+      workers:
+        description: Resident workers measured by the capacity benchmark
+        required: true
+        default: "1000"
+        type: choice
+        options: ["100", "1000", "10000"]
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Collect runtime tier evidence
+    runs-on: ${{ vars.PERFORMANCE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
+        with:
+          toolchain: 1.94.0
+
+      - name: Restore optimized benchmark build
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          cache-on-failure: true
+          shared-key: performance
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1e862dfacbd1d6d858c55d9b792c756523627244 # v7.1.4
+        with:
+          enable-cache: true
+
+      - name: Restore pinned comparison tools
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .benchmark-tools
+          key: benchmark-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('benchmarks/bootstrap_tools.py') }}
+
+      - name: Collect direct tier and capacity samples
+        env:
+          WORKERS: ${{ inputs.workers || '1000' }}
+        run: |
+          mkdir -p performance
+          cargo run --locked --release --example http_benchmark -- 100 5000 \
+            > performance/http-direct.json
+          cargo run --locked --release --example http_capacity_benchmark -- "$WORKERS" \
+            > performance/http-capacity.json
+          uv run benchmarks/bootstrap_tools.py
+          uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000 \
+            > performance/http-tcp.json
+
+      - name: Record runner metadata
+        env:
+          RUNNER_LABEL: ${{ vars.PERFORMANCE_RUNNER || 'ubuntu-latest' }}
+        run: |
+          jq -n \
+            --arg collected_at "$(date --utc --iso-8601=seconds)" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg kernel "$(uname -srvmo)" \
+            --arg cpu_model "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" \
+            --arg logical_cpus "$(nproc)" \
+            --arg memory_kib "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" \
+            --arg rustc "$(rustc --version --verbose | tr '\n' ';')" \
+            --arg runner "$RUNNER_LABEL" \
+            '{collected_at: $collected_at, git_sha: $git_sha, kernel: $kernel,
+              cpu_model: $cpu_model, logical_cpus: ($logical_cpus | tonumber),
+              memory_kib: ($memory_kib | tonumber), rustc: $rustc, runner: $runner}' \
+            > performance/host.json
+
+      - name: Compare with recorded baseline
+        env:
+          MODE: ${{ inputs.enforce && 'fail' || 'warn' }}
+        run: >-
+          uv run benchmarks/check_regression.py
+          benchmarks/results/http-direct-linux-x86_64-2026-07-18.json
+          performance/http-direct.json
+          --capacity-baseline benchmarks/results/http-capacity-linux-x86_64-2026-07-18.json
+          --capacity-candidate performance/http-capacity.json
+          --mode "$MODE"
+          --output performance/comparison.md
+
+      - name: Add comparison to workflow summary
+        if: always()
+        run: cat performance/comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw samples and comparison
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: runtime-performance-${{ github.run_id }}
+          path: performance/
+          if-no-files-found: error
+          retention-days: 90
