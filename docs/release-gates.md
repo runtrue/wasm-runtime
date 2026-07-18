@@ -36,3 +36,8 @@ cargo run --release --example http_capacity_benchmark -- 10000
 uv run benchmarks/bootstrap_tools.py
 uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000
 ```
+
+Repository release mechanics, protected-environment configuration, trusted
+publishing, SBOM generation, checksums, and the operator checklist are defined
+in [`releasing.md`](releasing.md). Automation being present does not satisfy a
+runtime gate by itself; each claim still needs recorded evidence.

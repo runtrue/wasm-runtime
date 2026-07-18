@@ -5,6 +5,11 @@ It targets standard `wasi:cli/command` and `wasi:http/handler` components
 instead of requiring a RunTrue-owned world. WASI 0.3 is primary and WASI 0.2
 is an explicit compatibility profile.
 
+The Rust crate is the primary implementation. It has no custom RunTrue guest
+world and does not depend on another application runtime. Release artifacts
+are built from standard Cargo source packages; see
+[`docs/releasing.md`](docs/releasing.md) for the guarded release process.
+
 The private alpha is gated on Linux x86_64. Wasmtime 46's stack-switching
 implementation required by WASI 0.3 is not supported on the current macOS
 runner toolchain; additional targets will be added only when their full test
@@ -122,10 +127,11 @@ lock, so concurrent callers do not duplicate compilation.
 
 ## Incubation policy
 
-The crate is `publish = false` until the 0.1 gates in
-[`docs/release-gates.md`](docs/release-gates.md) pass. crates.io source packages
-are public, so private GitHub and private CI artifacts are the only supported
-distribution channels during incubation.
+The crate remains unpublished until the 0.1 gates in
+[`docs/release-gates.md`](docs/release-gates.md) pass. Publishing requires an
+explicit choice in the protected release workflow. Crates.io source packages
+are public, so private GitHub releases are the only supported distribution
+channel during incubation.
 
 ## Development
 
@@ -133,6 +139,7 @@ distribution channels during incubation.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+scripts/release-check.sh
 ```
 
 Wasmtime 46's WASI 0.3 module is still labeled experimental by its embedding
