@@ -5,6 +5,11 @@ It targets standard `wasi:cli/command` components instead of requiring a
 RunTrue-owned world. WASI 0.3 is primary and WASI 0.2 is an explicit
 compatibility profile.
 
+The private alpha is gated on Linux x86_64. Wasmtime 46's stack-switching
+implementation required by WASI 0.3 is not supported on the current macOS
+runner toolchain; additional targets will be added only when their full test
+matrix passes.
+
 The package promotes component code through four observable states:
 
 | State | Retained material | Typical work before invocation |
