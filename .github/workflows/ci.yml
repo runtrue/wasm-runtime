@@ -1,22 +1,124 @@
-name: ci
+name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
 jobs:
-  rust:
+  quality:
+    name: Rust quality and package
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
         with:
+          toolchain: 1.94.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          cache-on-failure: true
+          shared-key: ci-quality
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test all targets
+        run: cargo test --locked --all-targets
+
+      - name: Test documentation
+        run: cargo test --locked --doc
+
+      - name: Build documentation without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+      - name: Verify the crates.io source package
+        run: cargo package --locked
+
+  supply-chain:
+    name: Dependency policy and advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check licenses, sources, bans, and advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: Run the RustSec advisory audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  fixtures:
+    name: Reproducible WASI fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-wasip1
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          cache-on-failure: true
+          shared-key: ci-fixtures
+
+      - name: Restore pinned benchmark tools
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .benchmark-tools
+          key: benchmark-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('benchmarks/bootstrap_tools.py') }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1e862dfacbd1d6d858c55d9b792c756523627244 # v7.1.4
+        with:
+          enable-cache: true
+
+      - name: Rebuild standard fixtures
+        run: |
+          uv run benchmarks/bootstrap_tools.py
+          uv run benchmarks/build_fixtures.py
+
+      - name: Verify fixtures are reproducible
+        run: >-
+          git diff --exit-code --
+          tests/fixtures/json-http-tool.component.wasm
+          tests/fixtures/p2-http-hello.component.wasm

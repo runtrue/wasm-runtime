@@ -4,3 +4,5 @@ benchmarks/fixtures/*/target/
 *.aot.json
 .DS_Store
 .benchmark-tools/
+/dist/
+/*.cdx.json

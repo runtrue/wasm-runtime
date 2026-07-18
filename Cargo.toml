@@ -6,7 +6,16 @@ rust-version = "1.94"
 license = "Apache-2.0"
 description = "A standards-first WASI Component runtime with cold, warmish, and warm tiers"
 repository = "https://github.com/runtrue/wasm-runtime"
-publish = false
+homepage = "https://github.com/runtrue/wasm-runtime"
+documentation = "https://docs.rs/runtrue-wasm-runtime"
+readme = "README.md"
+keywords = ["webassembly", "wasi", "wasmtime", "runtime", "aot"]
+categories = ["wasm"]
+publish = ["crates-io"]
+exclude = [
+    "/.github/**",
+    "/benchmarks/results/**",
+]
 
 [dependencies]
 bytes = "=1.11.1"
