@@ -9,3 +9,24 @@ Upstream: <https://github.com/bytecodealliance/wasmtime/tree/v46.0.1>
 
 Wasmtime is licensed under Apache-2.0 WITH LLVM-exception. The component's
 SHA-256 is `f6871cc812bb5102105f9498c2a135d4cf08969dd9a2d58f514a2a32d69b6681`.
+
+Additional standard fixtures from the same tag and license:
+
+- `p3-http-proxy.component.wasm` from `p3_http_proxy.rs`, SHA-256 recorded by
+  `f09271ee8f359790ec2c606dceb591912d1155156c1bc2f5c168f4957c669e4b`.
+- `p3-http-sleep.component.wasm` from `p3_cli_serve_sleep.rs`, SHA-256 recorded
+  `40114ffe2db05d91bb5ae27de49306f3df4e29bdb2efb86ec5c26c7c84b49060`.
+
+`json-http-tool.component.wasm` is built from this repository's
+`benchmarks/fixtures/json-http-tool` source using the standard `wasip2` 1.0.4
+bindings for WASI HTTP 0.2.12. Its SHA-256 is
+`62ee6ddbb780da2e249b2f65e703cded860afa3897bb6f4bbca8f3d0b69274e0`.
+
+`p2-http-hello.component.wasm` is built from this repository's
+`benchmarks/fixtures/p2-http-hello` source using the same standard `wasip2`
+bindings. Its SHA-256 is
+`26fa5f901aa88de442d856fd63d43b96f4944a44775de4480f9c219310403ede`.
+
+Both WASI HTTP 0.2 fixtures are componentized with Wasmtime 46.0.1's official
+`wasi_snapshot_preview1.proxy.wasm` adapter (SHA-256
+`82b0c20205fe8fab16c9e6a48fb044c61f8e439a1d40a456f5bb2f9b31518b4e`).

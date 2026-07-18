@@ -6,7 +6,6 @@ use crate::{
 use bytes::Bytes;
 use std::{
     collections::HashMap,
-    future::Future,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -609,7 +608,7 @@ impl RuntimeInner {
             HostState {
                 wasi: wasi.build(),
                 http: wasmtime_wasi_http::WasiHttpCtx::new(),
-                http_hooks: DenyHttpHooks,
+                http_hooks: crate::http::HttpHooks::deny(),
                 table: ResourceTable::new(),
                 limits,
             },
@@ -738,71 +737,9 @@ impl Drop for RuntimeInner {
 pub(crate) struct HostState {
     pub(crate) wasi: WasiCtx,
     pub(crate) http: wasmtime_wasi_http::WasiHttpCtx,
-    pub(crate) http_hooks: DenyHttpHooks,
+    pub(crate) http_hooks: crate::http::HttpHooks,
     pub(crate) table: ResourceTable,
     pub(crate) limits: StoreLimits,
-}
-
-pub(crate) struct DenyHttpHooks;
-
-impl wasmtime_wasi_http::p2::WasiHttpHooks for DenyHttpHooks {
-    fn send_request(
-        &mut self,
-        _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
-    {
-        Err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into())
-    }
-}
-
-impl wasmtime_wasi_http::p3::WasiHttpHooks for DenyHttpHooks {
-    fn send_request(
-        &mut self,
-        _request: http::Request<
-            http_body_util::combinators::UnsyncBoxBody<
-                Bytes,
-                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-            >,
-        >,
-        _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
-        _fut: Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        (),
-                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                    >,
-                > + Send,
-        >,
-    ) -> Box<
-        dyn Future<
-                Output = std::result::Result<
-                    (
-                        http::Response<
-                            http_body_util::combinators::UnsyncBoxBody<
-                                Bytes,
-                                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                            >,
-                        >,
-                        Box<
-                            dyn Future<
-                                    Output = std::result::Result<
-                                        (),
-                                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                                    >,
-                                > + Send,
-                        >,
-                    ),
-                    wasmtime_wasi::TrappableError<
-                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                    >,
-                >,
-            > + Send,
-    > {
-        Box::new(async {
-            Err(wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::HttpRequestDenied.into())
-        })
-    }
 }
 
 impl WasiView for HostState {

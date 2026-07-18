@@ -1,4 +1,6 @@
 /target
+benchmarks/fixtures/*/target/
 *.aot
 *.aot.json
 .DS_Store
+.benchmark-tools/

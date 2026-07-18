@@ -16,10 +16,23 @@ gates have recorded evidence.
   parallel fresh invocations, deterministic eviction, and a stable 10,000-load
   memory plateau.
 - Performance: publish p50/p95 cold, disk AOT, warmish, and warm results plus
-  throughput, AOT size, RSS, and 0.2-versus-0.3 comparisons.
+  throughput, AOT size, RSS, and 0.2-versus-0.3 comparisons. Compare the same
+  component through raw Wasmtime embedding, `wasmtime serve`, and this package;
+  keep direct handler and actual TCP results separate.
 - Compatibility: include WASI version, world/profile, exact Wasmtime version,
   target, CPU floor, compiler settings, and mitigation profile in cache keys.
 - Packaging: complete API docs, examples, license audit, advisory audit, SBOM,
   provenance, signed tags, and reproducible source archives.
-- Dogfood: RunTrue consumes the exact crate for at least one release cycle
-  through its private policy adapter without a fork of the runtime core.
+- Capabilities: a real JSON tool performs outbound HTTP only through an exact,
+  method-bound, body-limited grant; default deny and private-network policy are
+  covered by integration tests and documented in `docs/security.md`.
+
+Current evidence commands:
+
+```text
+cargo test --test http_security --test http_stress
+cargo run --release --example http_benchmark -- 20 1000
+cargo run --release --example http_capacity_benchmark -- 10000
+uv run benchmarks/bootstrap_tools.py
+uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000
+```

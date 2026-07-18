@@ -1,10 +1,15 @@
 //! Reproducible WASI HTTP cold, paused-resident, warmish, and throughput benchmark.
 
 use runtrue_wasm_runtime::{
-    HttpRequest, HttpService, HttpServiceConfig, HttpServiceState, PackageTier, Runtime,
+    AotAuthenticationKey, DiskCacheConfig, HttpRequest, HttpService, HttpServiceConfig,
+    HttpServiceState, PackageTier, Runtime, RuntimeConfig,
 };
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 const COMPONENT: &[u8] = include_bytes!("../tests/fixtures/p3-http-hello.component.wasm");
 
@@ -17,6 +22,8 @@ struct Report {
     host_arch: &'static str,
     iterations: usize,
     cold: Distribution,
+    disk_aot: Distribution,
+    disk_aot_artifact_bytes: u64,
     paused_resident: Distribution,
     warmish_restart: Distribution,
     throughput: Vec<Throughput>,
@@ -68,14 +75,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let (disk_aot, disk_aot_artifact_bytes) = disk_aot(iterations).await?;
     let report = Report {
-        schema: "runtrue-wasm-http-benchmark-v1",
+        schema: "runtrue-wasm-http-benchmark-v2",
         runtime_version: env!("CARGO_PKG_VERSION"),
         wasmtime_version: runtrue_wasm_runtime::WASMTIME_VERSION,
         host_os: std::env::consts::OS,
         host_arch: std::env::consts::ARCH,
         iterations,
         cold: cold(iterations).await?,
+        disk_aot,
+        disk_aot_artifact_bytes,
         paused_resident: paused_resident(iterations).await?,
         warmish_restart: warmish_restart(iterations).await?,
         throughput: vec![
@@ -86,6 +96,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+async fn disk_aot(iterations: usize) -> Result<(Distribution, u64), Box<dyn std::error::Error>> {
+    let directory = tempfile::TempDir::new()?;
+    let config = RuntimeConfig {
+        disk_cache: Some(DiskCacheConfig::new(
+            directory.path(),
+            AotAuthenticationKey::new([41; 32]),
+        )),
+        ..RuntimeConfig::default()
+    };
+    {
+        let runtime = Runtime::new(config.clone())?;
+        let program = runtime.load_bytes(COMPONENT)?;
+        program.http_service(service_config()).await?;
+    }
+    let artifact_bytes = directory_bytes(directory.path(), "aot")?;
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let harness = Instant::now();
+        let runtime_started = Instant::now();
+        let runtime = Runtime::new(config.clone())?;
+        let program = runtime.load_bytes(COMPONENT)?;
+        assert_eq!(program.tier(), PackageTier::DiskAot);
+        let runtime_init_ns = nanos(runtime_started.elapsed());
+        let service = program.http_service(service_config()).await?;
+        assert_eq!(service.startup_from(), PackageTier::DiskAot);
+        let response = service.handle(tool_request()).await?;
+        samples.push(Sample {
+            runtime_init_ns,
+            service_prepare_ns: nanos(service.startup_prepare()),
+            service_start_total_ns: nanos(service.startup_total()),
+            request_ns: nanos(response.elapsed),
+            harness_total_ns: nanos(harness.elapsed()),
+        });
+    }
+    Ok((distribution(samples), artifact_bytes))
+}
+
+fn directory_bytes(path: &Path, extension: &str) -> std::io::Result<u64> {
+    fs::read_dir(path)?.try_fold(0, |total, entry| {
+        let entry = entry?;
+        let bytes = if entry
+            .path()
+            .extension()
+            .is_some_and(|value| value == extension)
+        {
+            entry.metadata()?.len()
+        } else {
+            0
+        };
+        Ok(total + bytes)
+    })
 }
 
 async fn cold(iterations: usize) -> Result<Distribution, Box<dyn std::error::Error>> {

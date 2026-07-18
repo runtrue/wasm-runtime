@@ -22,8 +22,8 @@ The package promotes component code through four observable states:
 Every invocation receives a fresh Store, instance, resource table, WASI
 context, fuel budget, deadline, stdin, stdout, and stderr. Host environment,
 arguments, filesystem, and network are never inherited. Arguments and
-environment variables must be supplied explicitly; filesystem and network
-capability builders will be added only with confinement tests.
+environment variables must be supplied explicitly. Outbound HTTP is available
+only through exact, bounded grants.
 
 ```rust
 use runtrue_wasm_runtime::{CommandInput, Runtime};
@@ -70,14 +70,22 @@ reported separately.
 `Program::http_service` dispatches buffered requests to the standard WASI HTTP
 0.3 handler (or the 0.2 compatibility handler). The host owns the listener,
 admission control, deadlines, and response limits. Guest outbound HTTP remains
-denied until an explicit capability policy is added.
+denied unless the service receives an explicit origin, method, and byte-limit
+capability.
 
 ```rust
-# use runtrue_wasm_runtime::{HttpRequest, HttpServiceConfig, Result, Runtime};
+# use runtrue_wasm_runtime::{HttpRequest, HttpServiceConfig, OutboundHttpGrant, Result, Runtime};
 # async fn example() -> Result<()> {
 let runtime = Runtime::with_defaults()?;
 let program = runtime.load_file("tool-server.wasm")?;
-let service = program.http_service(HttpServiceConfig::default()).await?;
+let service = program.http_service(HttpServiceConfig {
+    outbound_grants: vec![
+        OutboundHttpGrant::new("https", "api.example.com")
+            .with_methods(["GET"])
+            .with_body_limits(1, 256 * 1024),
+    ],
+    ..HttpServiceConfig::default()
+}).await?;
 let response = service
     .handle(
         HttpRequest::new(
@@ -141,6 +149,10 @@ cargo run --release --example tier_benchmark -- 0.3 100 > wasi-0.3.json
 cargo run --release --example tier_benchmark -- 0.2 100 > wasi-0.2.json
 cargo run --release --example pause_benchmark -- 100 > pause.json
 cargo run --release --example http_benchmark -- 20 1000 > http.json
+cargo run --release --example http_capacity_benchmark -- 10000 > capacity.json
+uv run benchmarks/bootstrap_tools.py
+uv run benchmarks/build_fixtures.py
+uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000 > tcp.json
 ```
 
 The JSON includes every raw sample plus p50 and p95 runtime initialization,
@@ -149,4 +161,7 @@ The pause report records acknowledgement and resume-call percentiles, observed
 idle-eviction time and tier, and Linux process RSS around eviction. The HTTP
 report separately measures cold service construction plus first request,
 paused-resident requests, post-eviction warmish restarts, and throughput at
-concurrency 1, 8, and 32 using a standard WASI HTTP 0.3 component.
+concurrency 1, 8, and 32 using a standard WASI HTTP 0.3 component. It also
+reports authenticated disk-AOT HTTP startup and artifact size. See
+[`docs/benchmark-methodology.md`](docs/benchmark-methodology.md) and
+[`docs/security.md`](docs/security.md) before interpreting or publishing data.
