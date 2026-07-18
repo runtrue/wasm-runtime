@@ -27,6 +27,12 @@ pub enum Error {
     /// Execution was cancelled.
     #[error("component execution was cancelled")]
     Cancelled,
+    /// A paused invocation exceeded its configured resident lifetime.
+    #[error("paused invocation was evicted after its resident lifetime expired")]
+    IdleEvicted,
+    /// An operation was not valid for the invocation's current lifecycle state.
+    #[error("invalid invocation state: {0}")]
+    InvalidState(&'static str),
     /// Execution exceeded its wall-clock deadline.
     #[error("component execution timed out")]
     Timeout,

@@ -34,6 +34,8 @@ struct Sample {
     prepare_ns: u64,
     instantiate_ns: u64,
     execute_ns: u64,
+    suspended_ns: u64,
+    active_execute_ns: u64,
     call_total_ns: u64,
     harness_total_ns: u64,
 }
@@ -178,6 +180,8 @@ fn sample(
         prepare_ns: nanos(output.measurement.phases.prepare),
         instantiate_ns: nanos(output.measurement.phases.instantiate),
         execute_ns: nanos(output.measurement.phases.execute),
+        suspended_ns: nanos(output.measurement.phases.suspended),
+        active_execute_ns: nanos(output.measurement.phases.active_execute),
         call_total_ns: nanos(output.measurement.phases.total),
         harness_total_ns: nanos(harness.elapsed()),
     }
@@ -203,6 +207,8 @@ fn percentile(samples: &[Sample], percentile: usize) -> Sample {
         prepare_ns: field(|sample| sample.prepare_ns),
         instantiate_ns: field(|sample| sample.instantiate_ns),
         execute_ns: field(|sample| sample.execute_ns),
+        suspended_ns: field(|sample| sample.suspended_ns),
+        active_execute_ns: field(|sample| sample.active_execute_ns),
         call_total_ns: field(|sample| sample.call_total_ns),
         harness_total_ns: field(|sample| sample.harness_total_ns),
     }

@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 
 /// Standard WASI command generation implemented by a component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +40,22 @@ pub enum PackageTier {
     Warmish,
     /// A compiled component is retained in memory.
     Warm,
+}
+
+/// Lifecycle state of a spawned command invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvocationState {
+    /// The invocation is eligible to make progress.
+    Running,
+    /// A pause was requested but has not yet reached a cooperative yield point.
+    PauseRequested,
+    /// A cooperative pause is retaining the live Store and instance.
+    PausedResident,
+    /// The paused-residency limit expired and the live invocation was dropped.
+    Evicted,
+    /// The invocation has returned an output or error.
+    Finished,
 }
 
 /// Input for a standard WASI command invocation.
@@ -117,7 +134,13 @@ pub struct CommandOutput {
 
 /// Cloneable cancellation signal for one or more calls.
 #[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 
 impl CancellationToken {
     /// Create an uncancelled token.
@@ -128,12 +151,151 @@ impl CancellationToken {
 
     /// Request cancellation.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
     }
 
     /// Whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Cooperative pause signal for a live command invocation.
+///
+/// A pause retains the Store and guest state. It is observed at Wasmtime async
+/// and epoch yield points, so it is not an instruction-level stop signal.
+#[derive(Debug, Clone, Default)]
+pub struct PauseToken(Arc<PauseState>);
+
+#[derive(Debug, Default)]
+struct PauseState {
+    paused: AtomicBool,
+    resident: AtomicBool,
+    evicted: AtomicBool,
+    timing: Mutex<PauseTiming>,
+    notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct PauseTiming {
+    completed: Duration,
+    paused_at: Option<Instant>,
+}
+
+impl PauseToken {
+    /// Create an unpaused signal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a cooperative pause.
+    pub(crate) fn pause(&self) {
+        let mut timing = self.timing();
+        if !self.0.paused.swap(true, Ordering::AcqRel) {
+            self.0.resident.store(false, Ordering::Release);
+            timing.paused_at = Some(Instant::now());
+        }
+    }
+
+    /// Resume a resident invocation.
+    pub(crate) fn resume(&self) -> bool {
+        if self.is_evicted() {
+            return false;
+        }
+        let mut timing = self.timing();
+        if self.0.paused.swap(false, Ordering::AcqRel) {
+            self.0.resident.store(false, Ordering::Release);
+            if let Some(started) = timing.paused_at.take() {
+                timing.completed = timing.completed.saturating_add(started.elapsed());
+            }
+            self.0.notify.notify_waiters();
+        }
+        true
+    }
+
+    /// Whether a pause has been requested and not resumed.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.0.paused.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_evicted(&self) -> bool {
+        self.0.evicted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_resident(&self) -> bool {
+        self.0.resident.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_resident(&self) {
+        if self.is_paused() && !self.is_evicted() {
+            self.0.resident.store(true, Ordering::Release);
+            self.0.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn total_paused(&self) -> Duration {
+        let timing = self.timing();
+        timing.completed.saturating_add(
+            timing
+                .paused_at
+                .map_or(Duration::ZERO, |started| started.elapsed()),
+        )
+    }
+
+    pub(crate) async fn wait(&self, cancellation: &CancellationToken, resident_ttl: Duration) {
+        loop {
+            let notified = self.0.notify.notified();
+            if !self.is_paused() || cancellation.is_cancelled() {
+                return;
+            }
+            let remaining = {
+                let timing = self.timing();
+                timing.paused_at.map_or(resident_ttl, |started| {
+                    resident_ttl.saturating_sub(started.elapsed())
+                })
+            };
+            if remaining.is_zero() {
+                self.evict(cancellation);
+                return;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(remaining) => {
+                    if self.is_paused() {
+                        self.evict(cancellation);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn evict(&self, cancellation: &CancellationToken) {
+        self.0.evicted.store(true, Ordering::Release);
+        self.0.resident.store(false, Ordering::Release);
+        cancellation.cancel();
+        self.0.notify.notify_waiters();
+    }
+
+    fn timing(&self) -> std::sync::MutexGuard<'_, PauseTiming> {
+        self.0
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

@@ -10,7 +10,8 @@ gates have recorded evidence.
 - Isolation: prove no inherited environment, arguments, files, sockets, or
   process handles; test fresh Store and resource cleanup after every call.
 - Async: test streams, futures, backpressure, cancellation during host waits,
-  timeout of CPU-bound guests, and cleanup of guest task trees.
+  timeout of CPU-bound guests, resident pause/resume, idle eviction to warmish,
+  and cleanup of guest task trees.
 - Concurrency: prove one compilation per digest, bounded preparation workers,
   parallel fresh invocations, deterministic eviction, and a stable 10,000-load
   memory plateau.

@@ -1,6 +1,6 @@
 use crate::{
-    CommandInput, CommandOutput, Error, PackageTier, PhaseTimings, Result, RunMeasurement,
-    RuntimeConfig, WasiVersion,
+    CancellationToken, CommandInput, CommandOutput, Error, InvocationState, PackageTier,
+    PauseToken, PhaseTimings, Result, RunMeasurement, RuntimeConfig, WasiVersion,
     cache::{DiskCache, component_digest},
 };
 use bytes::Bytes;
@@ -205,6 +205,42 @@ impl Program {
     /// Returns an error for invalid limits, failed preparation, failed
     /// instantiation, a guest trap, timeout, or cancellation.
     pub async fn run(&self, input: CommandInput) -> Result<CommandOutput> {
+        self.run_controlled(input, PauseToken::new()).await
+    }
+
+    /// Spawn an independently controllable invocation on the current Tokio
+    /// runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called outside a Tokio runtime.
+    pub fn start(&self, input: CommandInput) -> Result<RunningCommand> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            Error::Configuration("Program::start requires an active Tokio runtime".to_owned())
+        })?;
+        let pause = PauseToken::new();
+        let cancellation = input.cancellation.clone();
+        let program = self.clone();
+        let task_pause = pause.clone();
+        let task = handle.spawn(async move {
+            let output = program.run_controlled(input, task_pause.clone()).await;
+            if matches!(output, Err(Error::IdleEvicted)) {
+                program.runtime.inner.demote(&program.digest);
+            }
+            output
+        });
+        Ok(RunningCommand {
+            pause,
+            cancellation,
+            task: Some(task),
+        })
+    }
+
+    async fn run_controlled(
+        &self,
+        input: CommandInput,
+        pause: PauseToken,
+    ) -> Result<CommandOutput> {
         if input.stdin.len() > self.runtime.inner.config.limits.max_input_bytes {
             return Err(Error::Limit("input bytes"));
         }
@@ -231,7 +267,8 @@ impl Program {
             exit_code,
             instantiate,
             execute,
-        } = self.runtime.inner.invoke(&prepared, input).await?;
+            suspended,
+        } = self.runtime.inner.invoke(&prepared, input, pause).await?;
 
         Ok(CommandOutput {
             stdout,
@@ -246,6 +283,8 @@ impl Program {
                     prepare,
                     instantiate,
                     execute,
+                    suspended,
+                    active_execute: execute.saturating_sub(suspended),
                     total: total_started.elapsed(),
                 },
             },
@@ -267,6 +306,118 @@ impl Program {
     }
 }
 
+/// A live command invocation with cooperative pause, resume, and cancellation.
+///
+/// Pausing retains the Store and guest state until
+/// [`RuntimeConfig::paused_resident_ttl`] expires. Expiry drops the invocation,
+/// demotes its package cache entry when possible, and returns
+/// [`Error::IdleEvicted`] from [`Self::wait`]. It never silently restarts the
+/// guest.
+pub struct RunningCommand {
+    pause: PauseToken,
+    cancellation: CancellationToken,
+    task: Option<tokio::task::JoinHandle<Result<CommandOutput>>>,
+}
+
+impl std::fmt::Debug for RunningCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunningCommand")
+            .field("state", &self.state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunningCommand {
+    /// Request a cooperative pause while retaining the live Store and instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the invocation has already finished or was evicted.
+    pub fn pause(&self) -> Result<()> {
+        match self.state() {
+            InvocationState::Running
+            | InvocationState::PauseRequested
+            | InvocationState::PausedResident => {
+                self.pause.pause();
+                Ok(())
+            }
+            InvocationState::Evicted => Err(Error::IdleEvicted),
+            InvocationState::Finished => Err(Error::InvalidState("invocation already finished")),
+        }
+    }
+
+    /// Resume the same resident Store and instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the invocation has already finished or its idle TTL
+    /// expired. An evicted invocation must be explicitly started again.
+    pub fn resume(&self) -> Result<()> {
+        match self.state() {
+            InvocationState::Running => Ok(()),
+            InvocationState::PauseRequested | InvocationState::PausedResident
+                if self.pause.resume() =>
+            {
+                Ok(())
+            }
+            InvocationState::PauseRequested
+            | InvocationState::PausedResident
+            | InvocationState::Evicted => Err(Error::IdleEvicted),
+            InvocationState::Finished => Err(Error::InvalidState("invocation already finished")),
+        }
+    }
+
+    /// Request cancellation, including while the invocation is paused.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Current observable invocation lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> InvocationState {
+        if self.pause.is_evicted() {
+            InvocationState::Evicted
+        } else if self
+            .task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            InvocationState::Finished
+        } else if self.pause.is_resident() {
+            InvocationState::PausedResident
+        } else if self.pause.is_paused() {
+            InvocationState::PauseRequested
+        } else {
+            InvocationState::Running
+        }
+    }
+
+    /// Wait for the invocation's output or terminal error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime error, [`Error::IdleEvicted`] after idle eviction,
+    /// or an execution error if the Tokio task failed.
+    pub async fn wait(mut self) -> Result<CommandOutput> {
+        let task = self
+            .task
+            .take()
+            .ok_or(Error::InvalidState("invocation result already consumed"))?;
+        task.await
+            .map_err(|error| Error::Execution(format!("invocation task failed: {error}")))?
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if self.task.is_some() {
+            self.cancellation.cancel();
+            let _ = self.pause.resume();
+        }
+    }
+}
+
 struct RuntimeInner {
     engine: Engine,
     p3_linker: Linker<HostState>,
@@ -281,6 +432,12 @@ struct RuntimeInner {
 }
 
 impl RuntimeInner {
+    fn demote(&self, digest: &str) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.demote(digest);
+        }
+    }
+
     fn tier(&self, digest: &str) -> PackageTier {
         if let Ok(mut memory) = self.memory.lock() {
             if memory.warm(digest).is_some() {
@@ -399,6 +556,7 @@ impl RuntimeInner {
         &self,
         prepared: &PreparedComponent,
         input: CommandInput,
+        pause: PauseToken,
     ) -> Result<InvocationResult> {
         let invocation_cancellation = input.cancellation.clone();
         let stdout =
@@ -438,19 +596,43 @@ impl RuntimeInner {
         store
             .set_fuel(self.config.limits.fuel)
             .map_err(|error| Error::Configuration(error.to_string()))?;
-        let deadline = Instant::now() + input.timeout;
+        let invocation_started = Instant::now();
+        let pause_baseline = pause.total_paused();
+        let timeout = input.timeout;
         let cancellation = input.cancellation.clone();
+        let callback_pause = pause.clone();
+        let callback_cancellation = cancellation.clone();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let callback_timed_out = Arc::clone(&timed_out);
+        let resident_ttl = self.config.paused_resident_ttl;
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(move |_| {
-            if cancellation.is_cancelled() || Instant::now() >= deadline {
+            let suspended = callback_pause.total_paused().saturating_sub(pause_baseline);
+            let active = invocation_started.elapsed().saturating_sub(suspended);
+            if callback_pause.is_evicted() || callback_cancellation.is_cancelled() {
                 Ok(UpdateDeadline::Interrupt)
+            } else if active >= timeout {
+                callback_timed_out.store(true, Ordering::Release);
+                Ok(UpdateDeadline::Interrupt)
+            } else if callback_pause.is_paused() {
+                callback_pause.mark_resident();
+                let waiting_pause = callback_pause.clone();
+                let waiting_cancellation = callback_cancellation.clone();
+                Ok(UpdateDeadline::YieldCustom(
+                    1,
+                    Box::pin(async move {
+                        waiting_pause
+                            .wait(&waiting_cancellation, resident_ttl)
+                            .await;
+                    }),
+                ))
             } else {
                 Ok(UpdateDeadline::Yield(1))
             }
         });
 
         let instantiate_started = Instant::now();
-        let (exit_code, instantiate, execute) = match prepared.version {
+        let (exit_code, instantiate, execute, suspended) = match prepared.version {
             WasiVersion::V0_3 => {
                 let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
                     &mut store,
@@ -461,19 +643,21 @@ impl RuntimeInner {
                 .map_err(|error| Error::Execution(error.to_string()))?;
                 let instantiate = instantiate_started.elapsed();
                 let execute_started = Instant::now();
+                let execute_pause_baseline = pause.total_paused();
                 let result = store
                     .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
                     .await
                     .map_err(|error| {
-                        map_execution_error(&error, &invocation_cancellation, deadline)
+                        map_execution_error(&error, &pause, &invocation_cancellation, &timed_out)
                     })?
                     .map_err(|error| {
-                        map_execution_error(&error, &invocation_cancellation, deadline)
+                        map_execution_error(&error, &pause, &invocation_cancellation, &timed_out)
                     })?;
                 (
                     u8::from(result.is_err()),
                     instantiate,
                     execute_started.elapsed(),
+                    pause.total_paused().saturating_sub(execute_pause_baseline),
                 )
             }
             WasiVersion::V0_2 => {
@@ -486,18 +670,25 @@ impl RuntimeInner {
                 .map_err(|error| Error::Execution(error.to_string()))?;
                 let instantiate = instantiate_started.elapsed();
                 let execute_started = Instant::now();
+                let execute_pause_baseline = pause.total_paused();
                 let result =
                     command
                         .wasi_cli_run()
                         .call_run(&mut store)
                         .await
                         .map_err(|error| {
-                            map_execution_error(&error, &invocation_cancellation, deadline)
+                            map_execution_error(
+                                &error,
+                                &pause,
+                                &invocation_cancellation,
+                                &timed_out,
+                            )
                         })?;
                 (
                     u8::from(result.is_err()),
                     instantiate,
                     execute_started.elapsed(),
+                    pause.total_paused().saturating_sub(execute_pause_baseline),
                 )
             }
         };
@@ -507,6 +698,7 @@ impl RuntimeInner {
             exit_code,
             instantiate,
             execute,
+            suspended,
         })
     }
 }
@@ -551,6 +743,7 @@ struct InvocationResult {
     exit_code: u8,
     instantiate: Duration,
     execute: Duration,
+    suspended: Duration,
 }
 
 struct CacheEntry<T> {
@@ -632,6 +825,10 @@ impl MemoryCache {
         }
     }
 
+    fn demote(&mut self, digest: &str) {
+        self.warm.remove(digest);
+    }
+
     fn tick(&mut self) -> u64 {
         self.sequence = self.sequence.wrapping_add(1).max(1);
         self.sequence
@@ -707,10 +904,11 @@ fn validate_config(config: &RuntimeConfig) -> Result<()> {
         || config.max_warmish_entries < config.max_warm_components
         || config.max_warmish_bytes == 0
         || config.background_workers == 0
+        || config.paused_resident_ttl.is_zero()
         || config.epoch_interval.is_zero()
     {
         return Err(Error::Configuration(
-            "cache capacities, background workers, and epoch interval must be positive; warmish entries must cover warm entries"
+            "cache capacities, background workers, pause TTL, and epoch interval must be positive; warmish entries must cover warm entries"
                 .to_owned(),
         ));
     }
@@ -735,13 +933,16 @@ fn spawn_epoch_ticker(
 
 fn map_execution_error(
     error: &wasmtime::Error,
-    cancellation: &crate::CancellationToken,
-    deadline: Instant,
+    pause: &PauseToken,
+    cancellation: &CancellationToken,
+    timed_out: &AtomicBool,
 ) -> Error {
-    if cancellation.is_cancelled() {
-        Error::Cancelled
-    } else if Instant::now() >= deadline {
+    if pause.is_evicted() {
+        Error::IdleEvicted
+    } else if timed_out.load(Ordering::Acquire) {
         Error::Timeout
+    } else if cancellation.is_cancelled() {
+        Error::Cancelled
     } else {
         Error::Execution(error.to_string())
     }

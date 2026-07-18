@@ -1,9 +1,10 @@
 //! Integration coverage for standard command profiles and preparation tiers.
 
 use runtrue_wasm_runtime::{
-    AotAuthenticationKey, CommandInput, DiskCacheConfig, PackageTier, Runtime, RuntimeConfig,
-    WasiVersion,
+    AotAuthenticationKey, CommandInput, DiskCacheConfig, Error, InvocationState, PackageTier,
+    RunningCommand, Runtime, RuntimeConfig, WasiVersion,
 };
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -91,6 +92,71 @@ fn wasi_0_3_command_is_the_primary_accepted_profile() {
     assert_eq!(output.exit_code, 0);
 }
 
+#[test]
+fn paused_invocation_resumes_the_same_resident_execution() {
+    let config = RuntimeConfig {
+        paused_resident_ttl: Duration::from_millis(250),
+        epoch_interval: Duration::from_millis(1),
+        ..RuntimeConfig::default()
+    };
+    let runtime = Runtime::new(config).unwrap();
+    let program = runtime.load_bytes(p2_spinning_command()).unwrap();
+    let tokio = tokio::runtime::Runtime::new().unwrap();
+
+    tokio.block_on(async {
+        program.prepare().await.unwrap();
+        let running = program
+            .start(CommandInput::default().with_timeout(Duration::from_secs(1)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        running.pause().unwrap();
+        wait_for_state(&running, InvocationState::PausedResident).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        running.resume().unwrap();
+        assert_eq!(running.state(), InvocationState::Running);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        running.cancel();
+        assert!(matches!(running.wait().await, Err(Error::Cancelled)));
+    });
+}
+
+#[test]
+fn idle_eviction_drops_the_store_and_demotes_the_package() {
+    let config = RuntimeConfig {
+        paused_resident_ttl: Duration::from_millis(20),
+        epoch_interval: Duration::from_millis(1),
+        ..RuntimeConfig::default()
+    };
+    let runtime = Runtime::new(config).unwrap();
+    let program = runtime.load_bytes(p2_spinning_command()).unwrap();
+    let tokio = tokio::runtime::Runtime::new().unwrap();
+
+    tokio.block_on(async {
+        program.prepare().await.unwrap();
+        let running = program
+            .start(CommandInput::default().with_timeout(Duration::from_secs(1)))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        running.pause().unwrap();
+        wait_for_state(&running, InvocationState::PausedResident).await;
+        assert!(matches!(running.wait().await, Err(Error::IdleEvicted)));
+        assert_eq!(program.tier(), PackageTier::Warmish);
+    });
+}
+
+async fn wait_for_state(running: &RunningCommand, expected: InvocationState) {
+    for _ in 0..100 {
+        if running.state() == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!(
+        "invocation did not reach {expected:?}; current state: {:?}",
+        running.state()
+    );
+}
+
 fn p2_command(marker: &str) -> Vec<u8> {
     wat::parse_str(format!(
         r#"
@@ -139,6 +205,30 @@ fn p3_command() -> Vec<u8> {
           (instance $run-instance
             (export "run" (func $run)))
           (export "wasi:cli/run@0.3.0"
+            (instance $run-instance)))
+        "#,
+    )
+    .unwrap()
+}
+
+fn p2_spinning_command() -> Vec<u8> {
+    wat::parse_str(
+        r#"
+        (component
+          (type $run-func (func (result (result))))
+          (type $run-interface (instance
+            (export "run" (func (type $run-func)))))
+          (core module $command
+            (func (export "run") (result i32)
+              (loop $spin
+                br $spin)
+              unreachable))
+          (core instance $command-instance (instantiate $command))
+          (func $run (type $run-func)
+            (canon lift (core func $command-instance "run")))
+          (instance $run-instance
+            (export "run" (func $run)))
+          (export "wasi:cli/run@0.2.12"
             (instance $run-instance)))
         "#,
     )

@@ -16,8 +16,11 @@ pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use config::{RuntimeConfig, RuntimeLimits};
 pub use error::{Error, Result};
 pub use measurement::{PhaseTimings, RunMeasurement};
-pub use runtime::{Program, Runtime, RuntimeBuilder};
-pub use types::{CancellationToken, CommandInput, CommandOutput, PackageTier, WasiVersion};
+pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder};
+pub use types::{
+    CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
+    WasiVersion,
+};
 
 /// Exact Wasmtime release used to compile serialized artifacts.
 pub const WASMTIME_VERSION: &str = "46.0.1";

@@ -45,6 +45,8 @@ pub struct RuntimeConfig {
     pub max_warmish_bytes: usize,
     /// Maximum concurrent background promotions.
     pub background_workers: usize,
+    /// Maximum time a cooperatively paused Store and instance remain resident.
+    pub paused_resident_ttl: Duration,
     /// Epoch watchdog interval.
     pub epoch_interval: Duration,
     /// Optional authenticated on-disk AOT cache.
@@ -60,6 +62,7 @@ impl Default for RuntimeConfig {
             max_warmish_entries: 1_024,
             max_warmish_bytes: 512 * 1024 * 1024,
             background_workers: 2,
+            paused_resident_ttl: Duration::from_secs(30),
             epoch_interval: Duration::from_millis(10),
             disk_cache: None,
             limits: RuntimeLimits::default(),

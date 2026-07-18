@@ -39,6 +39,37 @@ println!("tier: {:?}", output.measurement.prepared_from);
 # }
 ```
 
+## Pause, resume, and idle eviction
+
+`Program::start` returns a controllable live invocation. A pause preserves the
+same Store and guest state and is observed cooperatively at async and epoch
+yield points:
+
+```rust
+# use runtrue_wasm_runtime::{CommandInput, Result, Runtime};
+# async fn example() -> Result<()> {
+# let runtime = Runtime::with_defaults()?;
+# let program = runtime.load_file("tool.wasm")?;
+let running = program.start(CommandInput::default())?;
+running.pause()?;
+running.resume()?;
+let output = running.wait().await?;
+# Ok(())
+# }
+```
+
+A paused Store remains resident only for `RuntimeConfig::paused_resident_ttl`
+(30 seconds by default). Expiry drops the live invocation, returns
+`Error::IdleEvicted`, and demotes its package from warm to warmish when the AOT
+entry is retained. A later run is fresh; the runtime never silently replays a
+component and calls it a resume. Suspended and active execution durations are
+reported separately.
+
+For request-driven services with no guest state to preserve, do not keep an
+idle Store: retain the package at warm or warmish and create a fresh invocation
+for each request. Generic stateful hibernation would require an explicit guest
+checkpoint/restore contract because Wasmtime does not serialize live Stores.
+
 `load_*` returns immediately and schedules bounded background preparation when
 called inside Tokio. An immediate call joins the same per-digest preparation
 lock, so concurrent callers do not duplicate compilation.
@@ -70,7 +101,10 @@ argument selects WASI and the second is the sample count:
 ```text
 cargo run --release --example tier_benchmark -- 0.3 100 > wasi-0.3.json
 cargo run --release --example tier_benchmark -- 0.2 100 > wasi-0.2.json
+cargo run --release --example pause_benchmark -- 100 > pause.json
 ```
 
 The JSON includes every raw sample plus p50 and p95 runtime initialization,
 preparation, instantiation, execution, call-total, and harness-total timings.
+The pause report records acknowledgement and resume-call percentiles, observed
+idle-eviction time and tier, and Linux process RSS around eviction.

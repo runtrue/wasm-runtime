@@ -11,6 +11,10 @@ pub struct PhaseTimings {
     pub instantiate: Duration,
     /// Time spent inside the guest command.
     pub execute: Duration,
+    /// Time during execution for which a live invocation was paused.
+    pub suspended: Duration,
+    /// Guest execution time excluding cooperative suspension.
+    pub active_execute: Duration,
     /// Complete call duration.
     pub total: Duration,
 }
