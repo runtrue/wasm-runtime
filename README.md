@@ -1,9 +1,9 @@
 # RunTrue Wasm Runtime
 
 Private 0.1 incubation of a standards-first WebAssembly Component runtime.
-It targets standard `wasi:cli/command` components instead of requiring a
-RunTrue-owned world. WASI 0.3 is primary and WASI 0.2 is an explicit
-compatibility profile.
+It targets standard `wasi:cli/command` and `wasi:http/handler` components
+instead of requiring a RunTrue-owned world. WASI 0.3 is primary and WASI 0.2
+is an explicit compatibility profile.
 
 The private alpha is gated on Linux x86_64. Wasmtime 46's stack-switching
 implementation required by WASI 0.3 is not supported on the current macOS
@@ -65,10 +65,48 @@ entry is retained. A later run is fresh; the runtime never silently replays a
 component and calls it a resume. Suspended and active execution durations are
 reported separately.
 
-For request-driven services with no guest state to preserve, do not keep an
-idle Store: retain the package at warm or warmish and create a fresh invocation
-for each request. Generic stateful hibernation would require an explicit guest
-checkpoint/restore contract because Wasmtime does not serialize live Stores.
+## WASI HTTP and tool calls
+
+`Program::http_service` dispatches buffered requests to the standard WASI HTTP
+0.3 handler (or the 0.2 compatibility handler). The host owns the listener,
+admission control, deadlines, and response limits. Guest outbound HTTP remains
+denied until an explicit capability policy is added.
+
+```rust
+# use runtrue_wasm_runtime::{HttpRequest, HttpServiceConfig, Result, Runtime};
+# async fn example() -> Result<()> {
+let runtime = Runtime::with_defaults()?;
+let program = runtime.load_file("tool-server.wasm")?;
+let service = program.http_service(HttpServiceConfig::default()).await?;
+let response = service
+    .handle(
+        HttpRequest::new(
+            "POST",
+            "http://localhost/tools/call",
+            br#"{"name":"search","arguments":{"query":"wasm"}}"#,
+        )
+        .with_header("content-type", "application/json"),
+    )
+    .await?;
+# let _ = response;
+# Ok(())
+# }
+```
+
+An idle reusable worker is observable as `PausedResident`: it retains the live
+Store and guest state for the fastest next request. When `idle_worker_ttl`
+expires, the service drops the live worker and its pre-instance, then demotes
+the package to warmish. The next request rebuilds from in-memory AOT without
+recompiling. This is automatic, bounded tier movement—not serialization of a
+live Store.
+
+The minimal HTTP/1 host can serve the included standard fixture or a supplied
+component:
+
+```text
+cargo run --release --example http_server
+cargo run --release --example http_server -- tool-server.wasm 127.0.0.1:8080
+```
 
 `load_*` returns immediately and schedules bounded background preparation when
 called inside Tokio. An immediate call joins the same per-digest preparation
@@ -102,9 +140,13 @@ argument selects WASI and the second is the sample count:
 cargo run --release --example tier_benchmark -- 0.3 100 > wasi-0.3.json
 cargo run --release --example tier_benchmark -- 0.2 100 > wasi-0.2.json
 cargo run --release --example pause_benchmark -- 100 > pause.json
+cargo run --release --example http_benchmark -- 20 1000 > http.json
 ```
 
 The JSON includes every raw sample plus p50 and p95 runtime initialization,
 preparation, instantiation, execution, call-total, and harness-total timings.
 The pause report records acknowledgement and resume-call percentiles, observed
-idle-eviction time and tier, and Linux process RSS around eviction.
+idle-eviction time and tier, and Linux process RSS around eviction. The HTTP
+report separately measures cold service construction plus first request,
+paused-resident requests, post-eviction warmish restarts, and throughput at
+concurrency 1, 8, and 32 using a standard WASI HTTP 0.3 component.

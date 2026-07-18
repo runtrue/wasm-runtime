@@ -19,12 +19,51 @@ pub enum WasiVersion {
     V0_2,
 }
 
-impl WasiVersion {
+/// Standard WASI world implemented by a component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WasiProfile {
+    /// WASI 0.3 command world.
+    Cli0_3,
+    /// WASI 0.2 command world.
+    Cli0_2,
+    /// WASI HTTP 0.3 service world.
+    Http0_3,
+    /// WASI HTTP 0.2 proxy world.
+    Http0_2,
+}
+
+impl WasiProfile {
+    pub(crate) const ALL: [Self; 4] = [Self::Cli0_3, Self::Cli0_2, Self::Http0_3, Self::Http0_2];
+
     pub(crate) const fn cache_id(self) -> &'static str {
         match self {
-            Self::V0_3 => "wasi-cli-command-0.3.0",
-            Self::V0_2 => "wasi-cli-command-0.2",
+            Self::Cli0_3 => "wasi-cli-command-0.3.0",
+            Self::Cli0_2 => "wasi-cli-command-0.2",
+            Self::Http0_3 => "wasi-http-service-0.3.0",
+            Self::Http0_2 => "wasi-http-proxy-0.2",
         }
+    }
+
+    /// WASI generation used by this standard world.
+    #[must_use]
+    pub const fn version(self) -> WasiVersion {
+        match self {
+            Self::Cli0_3 | Self::Http0_3 => WasiVersion::V0_3,
+            Self::Cli0_2 | Self::Http0_2 => WasiVersion::V0_2,
+        }
+    }
+
+    /// Whether this is a standard WASI command profile.
+    #[must_use]
+    pub const fn is_command(self) -> bool {
+        matches!(self, Self::Cli0_3 | Self::Cli0_2)
+    }
+
+    /// Whether this is a standard WASI HTTP handler profile.
+    #[must_use]
+    pub const fn is_http(self) -> bool {
+        matches!(self, Self::Http0_3 | Self::Http0_2)
     }
 }
 

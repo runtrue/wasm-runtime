@@ -1,11 +1,12 @@
 use crate::{
     CancellationToken, CommandInput, CommandOutput, Error, InvocationState, PackageTier,
-    PauseToken, PhaseTimings, Result, RunMeasurement, RuntimeConfig, WasiVersion,
+    PauseToken, PhaseTimings, Result, RunMeasurement, RuntimeConfig, WasiProfile,
     cache::{DiskCache, component_digest},
 };
 use bytes::Bytes;
 use std::{
     collections::HashMap,
+    future::Future,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -55,7 +56,7 @@ impl RuntimeBuilder {
 /// Shared WASI Component runtime and package cache.
 #[derive(Clone)]
 pub struct Runtime {
-    inner: Arc<RuntimeInner>,
+    pub(crate) inner: Arc<RuntimeInner>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -78,8 +79,16 @@ impl Runtime {
         let mut p3_linker = Linker::new(&engine);
         wasmtime_wasi::p3::add_to_linker(&mut p3_linker)
             .map_err(|error| Error::Configuration(error.to_string()))?;
+        // Preview 3 components produced through the current preview 1 adapter
+        // may still import preview 2 CLI interfaces alongside their p3 export.
+        wasmtime_wasi::p2::add_to_linker_async(&mut p3_linker)
+            .map_err(|error| Error::Configuration(error.to_string()))?;
+        wasmtime_wasi_http::p3::add_to_linker(&mut p3_linker)
+            .map_err(|error| Error::Configuration(error.to_string()))?;
         let mut p2_linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut p2_linker)
+            .map_err(|error| Error::Configuration(error.to_string()))?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut p2_linker)
             .map_err(|error| Error::Configuration(error.to_string()))?;
         let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
         let disk = config
@@ -155,9 +164,9 @@ impl Runtime {
 /// Loaded standard WASI command component.
 #[derive(Clone)]
 pub struct Program {
-    runtime: Runtime,
-    digest: String,
-    bytes: Arc<[u8]>,
+    pub(crate) runtime: Runtime,
+    pub(crate) digest: String,
+    pub(crate) bytes: Arc<[u8]>,
 }
 
 impl std::fmt::Debug for Program {
@@ -260,6 +269,11 @@ impl Program {
             .prepare(&self.digest, Arc::clone(&self.bytes))
             .await?;
         let prepare = prepare_started.elapsed();
+        if !prepared.profile.is_command() {
+            return Err(Error::UnsupportedComponent(
+                "HTTP components must be invoked through Program::http_service".to_owned(),
+            ));
+        }
 
         let InvocationResult {
             stdout,
@@ -274,11 +288,11 @@ impl Program {
             stdout,
             stderr,
             exit_code,
-            wasi_version: prepared.version,
+            wasi_version: prepared.profile.version(),
             measurement: RunMeasurement {
                 prepared_from,
                 retained_as: PackageTier::Warm,
-                wasi_version: prepared.version,
+                wasi_version: prepared.profile.version(),
                 phases: PhaseTimings {
                     prepare,
                     instantiate,
@@ -418,21 +432,21 @@ impl Drop for RunningCommand {
     }
 }
 
-struct RuntimeInner {
-    engine: Engine,
-    p3_linker: Linker<HostState>,
-    p2_linker: Linker<HostState>,
+pub(crate) struct RuntimeInner {
+    pub(crate) engine: Engine,
+    pub(crate) p3_linker: Linker<HostState>,
+    pub(crate) p2_linker: Linker<HostState>,
     memory: Mutex<MemoryCache>,
     preparation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     disk: Option<DiskCache>,
     background: Arc<Semaphore>,
     stop_epoch: Arc<AtomicBool>,
     epoch_thread: Option<thread::JoinHandle<()>>,
-    config: RuntimeConfig,
+    pub(crate) config: RuntimeConfig,
 }
 
 impl RuntimeInner {
-    fn demote(&self, digest: &str) {
+    pub(crate) fn demote(&self, digest: &str) {
         if let Ok(mut memory) = self.memory.lock() {
             memory.demote(digest);
         }
@@ -448,7 +462,9 @@ impl RuntimeInner {
             }
         }
         if self.disk.as_ref().is_some_and(|disk| {
-            disk.contains(digest, WasiVersion::V0_3) || disk.contains(digest, WasiVersion::V0_2)
+            WasiProfile::ALL
+                .into_iter()
+                .any(|profile| disk.contains(digest, profile))
         }) {
             PackageTier::DiskAot
         } else {
@@ -456,7 +472,11 @@ impl RuntimeInner {
         }
     }
 
-    async fn prepare(&self, digest: &str, source: Arc<[u8]>) -> Result<Arc<PreparedComponent>> {
+    pub(crate) async fn prepare(
+        &self,
+        digest: &str,
+        source: Arc<[u8]>,
+    ) -> Result<Arc<PreparedComponent>> {
         if let Some(component) = self
             .memory
             .lock()
@@ -500,11 +520,11 @@ impl RuntimeInner {
         }
 
         if let Some(disk) = &self.disk {
-            for version in [WasiVersion::V0_3, WasiVersion::V0_2] {
-                if let Some(bytes) = disk.load(digest, version)? {
-                    let aot = Arc::new(PreparedAot { bytes, version });
+            for profile in WasiProfile::ALL {
+                if let Some(bytes) = disk.load(digest, profile)? {
+                    let aot = Arc::new(PreparedAot { bytes, profile });
                     let prepared = Arc::new(deserialize_component(&self.engine, &aot)?);
-                    if prepared.version != version {
+                    if prepared.profile != profile {
                         return Err(Error::Cache(
                             "serialized artifact profile does not match its identity".to_owned(),
                         ));
@@ -525,21 +545,21 @@ impl RuntimeInner {
         let prepared = tokio::task::spawn_blocking(move || {
             let component = Component::from_binary(&engine, &source_for_compile)
                 .map_err(|error| Error::Preparation(format!("{error:?}")))?;
-            let version = detect_version(&engine, &component)?;
+            let profile = detect_profile(&engine, &component)?;
             let bytes = component
                 .serialize()
                 .map_err(|error| Error::Preparation(error.to_string()))?;
-            Ok::<_, Error>((PreparedComponent { component, version }, bytes))
+            Ok::<_, Error>((PreparedComponent { component, profile }, bytes))
         })
         .await
         .map_err(|error| Error::Preparation(format!("compiler task failed: {error}")))??;
         let (prepared, aot_bytes) = prepared;
         if let Some(disk) = &self.disk {
-            disk.publish(digest, prepared.version, &aot_bytes)?;
+            disk.publish(digest, prepared.profile, &aot_bytes)?;
         }
         let aot = Arc::new(PreparedAot {
             bytes: aot_bytes,
-            version: prepared.version,
+            profile: prepared.profile,
         });
         let prepared = Arc::new(prepared);
         let mut memory = self
@@ -588,6 +608,8 @@ impl RuntimeInner {
             &self.engine,
             HostState {
                 wasi: wasi.build(),
+                http: wasmtime_wasi_http::WasiHttpCtx::new(),
+                http_hooks: DenyHttpHooks,
                 table: ResourceTable::new(),
                 limits,
             },
@@ -632,8 +654,8 @@ impl RuntimeInner {
         });
 
         let instantiate_started = Instant::now();
-        let (exit_code, instantiate, execute, suspended) = match prepared.version {
-            WasiVersion::V0_3 => {
+        let (exit_code, instantiate, execute, suspended) = match prepared.profile {
+            WasiProfile::Cli0_3 => {
                 let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
@@ -660,7 +682,7 @@ impl RuntimeInner {
                     pause.total_paused().saturating_sub(execute_pause_baseline),
                 )
             }
-            WasiVersion::V0_2 => {
+            WasiProfile::Cli0_2 => {
                 let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
@@ -691,6 +713,7 @@ impl RuntimeInner {
                     pause.total_paused().saturating_sub(execute_pause_baseline),
                 )
             }
+            WasiProfile::Http0_3 | WasiProfile::Http0_2 => unreachable!("validated above"),
         };
         Ok(InvocationResult {
             stdout: stdout.contents().to_vec(),
@@ -712,10 +735,74 @@ impl Drop for RuntimeInner {
     }
 }
 
-struct HostState {
-    wasi: WasiCtx,
-    table: ResourceTable,
-    limits: StoreLimits,
+pub(crate) struct HostState {
+    pub(crate) wasi: WasiCtx,
+    pub(crate) http: wasmtime_wasi_http::WasiHttpCtx,
+    pub(crate) http_hooks: DenyHttpHooks,
+    pub(crate) table: ResourceTable,
+    pub(crate) limits: StoreLimits,
+}
+
+pub(crate) struct DenyHttpHooks;
+
+impl wasmtime_wasi_http::p2::WasiHttpHooks for DenyHttpHooks {
+    fn send_request(
+        &mut self,
+        _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        Err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into())
+    }
+}
+
+impl wasmtime_wasi_http::p3::WasiHttpHooks for DenyHttpHooks {
+    fn send_request(
+        &mut self,
+        _request: http::Request<
+            http_body_util::combinators::UnsyncBoxBody<
+                Bytes,
+                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+            >,
+        >,
+        _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        _fut: Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        (),
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                    >,
+                > + Send,
+        >,
+    ) -> Box<
+        dyn Future<
+                Output = std::result::Result<
+                    (
+                        http::Response<
+                            http_body_util::combinators::UnsyncBoxBody<
+                                Bytes,
+                                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                            >,
+                        >,
+                        Box<
+                            dyn Future<
+                                    Output = std::result::Result<
+                                        (),
+                                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                                    >,
+                                > + Send,
+                        >,
+                    ),
+                    wasmtime_wasi::TrappableError<
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
+                    >,
+                >,
+            > + Send,
+    > {
+        Box::new(async {
+            Err(wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::HttpRequestDenied.into())
+        })
+    }
 }
 
 impl WasiView for HostState {
@@ -727,14 +814,34 @@ impl WasiView for HostState {
     }
 }
 
-struct PreparedComponent {
-    component: Component,
-    version: WasiVersion,
+impl wasmtime_wasi_http::p2::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p2::WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
+impl wasmtime_wasi_http::p3::WasiHttpView for HostState {
+    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
+        wasmtime_wasi_http::p3::WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
+    }
+}
+
+pub(crate) struct PreparedComponent {
+    pub(crate) component: Component,
+    pub(crate) profile: WasiProfile,
 }
 
 struct PreparedAot {
     bytes: Vec<u8>,
-    version: WasiVersion,
+    profile: WasiProfile,
 }
 
 struct InvocationResult {
@@ -849,33 +956,40 @@ fn deserialize_component(engine: &Engine, aot: &PreparedAot) -> Result<PreparedC
     // cache. The identity includes Wasmtime, target, compiler, and WASI profile.
     let component = unsafe { Component::deserialize(engine, &aot.bytes) }
         .map_err(|error| Error::Preparation(error.to_string()))?;
-    let detected = detect_version(engine, &component)?;
-    if detected != aot.version {
+    let detected = detect_profile(engine, &component)?;
+    if detected != aot.profile {
         return Err(Error::Cache(
             "deserialized component profile mismatch".to_owned(),
         ));
     }
     Ok(PreparedComponent {
         component,
-        version: detected,
+        profile: detected,
     })
 }
 
-fn detect_version(engine: &Engine, component: &Component) -> Result<WasiVersion> {
-    let mut p3 = false;
-    let mut p2 = false;
+fn detect_profile(engine: &Engine, component: &Component) -> Result<WasiProfile> {
+    let mut profiles = Vec::new();
     for (name, _) in component.component_type().exports(engine) {
-        p3 |= name.starts_with("wasi:cli/run@0.3.");
-        p2 |= name.starts_with("wasi:cli/run@0.2.");
+        if name.starts_with("wasi:cli/run@0.3.") {
+            profiles.push(WasiProfile::Cli0_3);
+        } else if name.starts_with("wasi:cli/run@0.2.") {
+            profiles.push(WasiProfile::Cli0_2);
+        } else if name.starts_with("wasi:http/handler@0.3.") {
+            profiles.push(WasiProfile::Http0_3);
+        } else if name.starts_with("wasi:http/incoming-handler@0.2.") {
+            profiles.push(WasiProfile::Http0_2);
+        }
     }
-    match (p3, p2) {
-        (true, false) => Ok(WasiVersion::V0_3),
-        (false, true) => Ok(WasiVersion::V0_2),
-        (false, false) => Err(Error::UnsupportedComponent(
-            "expected an exported wasi:cli/run@0.3.x or @0.2.x interface".to_owned(),
+    profiles.sort_by_key(|profile| profile.cache_id());
+    profiles.dedup();
+    match profiles.as_slice() {
+        [profile] => Ok(*profile),
+        [] => Err(Error::UnsupportedComponent(
+            "expected a standard WASI CLI or HTTP handler export".to_owned(),
         )),
-        (true, true) => Err(Error::UnsupportedComponent(
-            "component exports both WASI 0.2 and 0.3 command interfaces".to_owned(),
+        _ => Err(Error::UnsupportedComponent(
+            "component exports more than one supported WASI world".to_owned(),
         )),
     }
 }

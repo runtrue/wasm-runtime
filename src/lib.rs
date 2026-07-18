@@ -8,6 +8,7 @@
 mod cache;
 mod config;
 mod error;
+mod http;
 mod measurement;
 mod runtime;
 mod types;
@@ -15,11 +16,14 @@ mod types;
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use config::{RuntimeConfig, RuntimeLimits};
 pub use error::{Error, Result};
+pub use http::{
+    HttpRequest, HttpResponse, HttpService, HttpServiceConfig, HttpServiceMetrics, HttpServiceState,
+};
 pub use measurement::{PhaseTimings, RunMeasurement};
 pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder};
 pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
-    WasiVersion,
+    WasiProfile, WasiVersion,
 };
 
 /// Exact Wasmtime release used to compile serialized artifacts.

@@ -1,4 +1,4 @@
-use crate::{Error, Result, WASMTIME_VERSION, WasiVersion};
+use crate::{Error, Result, WASMTIME_VERSION, WasiProfile};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -89,14 +89,14 @@ impl DiskCache {
         Ok(Self { config, target })
     }
 
-    pub(crate) fn contains(&self, digest: &str, version: WasiVersion) -> bool {
-        let (artifact, metadata) = self.paths(digest, version);
+    pub(crate) fn contains(&self, digest: &str, profile: WasiProfile) -> bool {
+        let (artifact, metadata) = self.paths(digest, profile);
         artifact.is_file() && metadata.is_file()
     }
 
-    pub(crate) fn load(&self, digest: &str, version: WasiVersion) -> Result<Option<Vec<u8>>> {
-        let identity = self.identity(digest, version);
-        let (artifact_path, metadata_path) = self.paths(digest, version);
+    pub(crate) fn load(&self, digest: &str, profile: WasiProfile) -> Result<Option<Vec<u8>>> {
+        let identity = self.identity(digest, profile);
+        let (artifact_path, metadata_path) = self.paths(digest, profile);
         if !artifact_path.exists() && !metadata_path.exists() {
             return Ok(None);
         }
@@ -131,7 +131,7 @@ impl DiskCache {
     pub(crate) fn publish(
         &self,
         digest: &str,
-        version: WasiVersion,
+        profile: WasiProfile,
         artifact: &[u8],
     ) -> Result<()> {
         if artifact.len() > self.config.max_entry_bytes {
@@ -139,7 +139,7 @@ impl DiskCache {
                 "artifact exceeds the configured limit".to_owned(),
             ));
         }
-        let identity = self.identity(digest, version);
+        let identity = self.identity(digest, profile);
         let tag = self
             .authentication_tag(&identity, artifact)?
             .finalize()
@@ -151,17 +151,17 @@ impl DiskCache {
         };
         let metadata = serde_json::to_vec(&metadata)
             .map_err(|error| Error::Cache(format!("metadata encoding failed: {error}")))?;
-        let (artifact_path, metadata_path) = self.paths(digest, version);
+        let (artifact_path, metadata_path) = self.paths(digest, profile);
         atomic_publish(&artifact_path, artifact)?;
         atomic_publish(&metadata_path, &metadata)?;
         Ok(())
     }
 
-    fn identity(&self, digest: &str, version: WasiVersion) -> CacheIdentity {
+    fn identity(&self, digest: &str, profile: WasiProfile) -> CacheIdentity {
         CacheIdentity {
             format: 1,
             component_digest: digest.to_owned(),
-            profile: version.cache_id().to_owned(),
+            profile: profile.cache_id().to_owned(),
             wasmtime_version: WASMTIME_VERSION.to_owned(),
             target: self.target.clone(),
             compiler_profile: "cranelift-speed-and-size;component-async;fuel;epoch;baseline"
@@ -169,10 +169,12 @@ impl DiskCache {
         }
     }
 
-    fn paths(&self, digest: &str, version: WasiVersion) -> (PathBuf, PathBuf) {
-        let profile = match version {
-            WasiVersion::V0_3 => "p3",
-            WasiVersion::V0_2 => "p2",
+    fn paths(&self, digest: &str, profile: WasiProfile) -> (PathBuf, PathBuf) {
+        let profile = match profile {
+            WasiProfile::Cli0_3 => "cli-p3",
+            WasiProfile::Cli0_2 => "cli-p2",
+            WasiProfile::Http0_3 => "http-p3",
+            WasiProfile::Http0_2 => "http-p2",
         };
         let stem = format!("{digest}-{profile}");
         (
