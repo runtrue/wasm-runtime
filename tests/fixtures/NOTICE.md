@@ -30,3 +30,8 @@ bindings. Its SHA-256 is
 Both WASI HTTP 0.2 fixtures are componentized with Wasmtime 46.0.1's official
 `wasi_snapshot_preview1.proxy.wasm` adapter (SHA-256
 `82b0c20205fe8fab16c9e6a48fb044c61f8e439a1d40a456f5bb2f9b31518b4e`).
+
+`oversized-output.component.wasm` is built from the adjacent
+`oversized_output.rs` source with the pinned Rust toolchain's standard
+`wasm32-wasip2` target. It is used only to prove bounded stdout handling. Its
+SHA-256 is `d27c3e2904499dc70ef601009763dd8867adc811320cdbedce2628a1635fdbbf`.

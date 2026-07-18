@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -56,6 +56,15 @@ impl RuntimeBuilder {
 #[derive(Clone)]
 pub struct Runtime {
     pub(crate) inner: Arc<RuntimeInner>,
+}
+
+/// Point-in-time operational counters for a [`Runtime`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeMetrics {
+    /// Compiled AOT artifacts that could not be persisted to the optional disk
+    /// cache. The in-memory warm and warmish entries remain usable.
+    pub disk_publish_failures: u64,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -111,6 +120,7 @@ impl Runtime {
                 preparation_locks: Mutex::new(HashMap::new()),
                 disk,
                 background: Arc::new(Semaphore::new(background_workers)),
+                disk_publish_failures: AtomicU64::new(0),
                 stop_epoch,
                 epoch_thread: Some(epoch_thread),
                 config,
@@ -125,6 +135,14 @@ impl Runtime {
     /// Returns an error when runtime initialization fails.
     pub fn with_defaults() -> Result<Self> {
         RuntimeBuilder::new().build()
+    }
+
+    /// Read point-in-time operational counters shared by all runtime clones.
+    #[must_use]
+    pub fn metrics(&self) -> RuntimeMetrics {
+        RuntimeMetrics {
+            disk_publish_failures: self.inner.disk_publish_failures.load(Ordering::Relaxed),
+        }
     }
 
     /// Load component bytes and schedule bounded background promotion when
@@ -439,6 +457,7 @@ pub(crate) struct RuntimeInner {
     preparation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     disk: Option<DiskCache>,
     background: Arc<Semaphore>,
+    disk_publish_failures: AtomicU64,
     stop_epoch: Arc<AtomicBool>,
     epoch_thread: Option<thread::JoinHandle<()>>,
     pub(crate) config: RuntimeConfig,
@@ -554,7 +573,13 @@ impl RuntimeInner {
         .map_err(|error| Error::Preparation(format!("compiler task failed: {error}")))??;
         let (prepared, aot_bytes) = prepared;
         if let Some(disk) = &self.disk {
-            disk.publish(digest, prepared.profile, &aot_bytes)?;
+            // The disk cache is an optional acceleration layer. Once trusted
+            // source has compiled successfully, a quota, permission, or I/O
+            // failure must not discard the usable in-memory result. Existing
+            // entries still fail closed on load before this path is reached.
+            if disk.publish(digest, prepared.profile, &aot_bytes).is_err() {
+                self.disk_publish_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let aot = Arc::new(PreparedAot {
             bytes: aot_bytes,

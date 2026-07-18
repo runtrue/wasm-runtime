@@ -1,0 +1,21 @@
+{
+  "duration_seconds": 10.00899570499314,
+  "concurrency": 8,
+  "requests": 38996,
+  "errors": 0,
+  "requests_per_second": 3896.09518770662,
+  "latency_p50_ns_upper_bound": 2097152,
+  "latency_p95_ns_upper_bound": 4194304,
+  "latency_p99_ns_upper_bound": 4194304,
+  "rss_first_bytes": 25272320,
+  "rss_last_bytes": 29048832,
+  "rss_max_bytes": 29048832,
+  "error_samples": [],
+  "schema": "runtrue-wasm-http-soak-v1",
+  "host_os": "linux",
+  "host_arch": "x86_64",
+  "python": "3.14.4",
+  "runtime_version": "path+file:///root/.codex/worktrees/cd57/wasm-runtime#runtrue-wasm-runtime@0.1.0-alpha.4",
+  "server_ready": "listening=http://127.0.0.1:48927 startup_from=Cold startup_us=282516",
+  "pid": 2878723
+}

@@ -8,6 +8,11 @@ is an explicit compatibility profile.
 The Rust crate is the primary implementation. It has no custom RunTrue guest
 world and does not depend on another application runtime. Release artifacts
 are built from standard Cargo source packages.
+The public API and production host boundary are defined in
+[`docs/api-stability.md`](docs/api-stability.md) and
+[`docs/production-isolation.md`](docs/production-isolation.md).
+Authenticated cache maintenance is covered by
+[`docs/cache-operations.md`](docs/cache-operations.md).
 
 The private alpha is gated on Linux x86_64. Wasmtime 46's stack-switching
 implementation required by WASI 0.3 is not supported on the current macOS
@@ -170,4 +175,8 @@ paused-resident requests, post-eviction warmish restarts, and throughput at
 concurrency 1, 8, and 32 using a standard WASI HTTP 0.3 component. It also
 reports authenticated disk-AOT HTTP startup and artifact size. See
 [`docs/benchmark-methodology.md`](docs/benchmark-methodology.md) and
-[`docs/security.md`](docs/security.md) before interpreting or publishing data.
+[`docs/performance-regressions.md`](docs/performance-regressions.md) before
+interpreting or publishing data, and [`docs/security.md`](docs/security.md)
+before deploying untrusted components.
+Long-running private release candidates use the real-TCP procedure in
+[`docs/soak-testing.md`](docs/soak-testing.md).

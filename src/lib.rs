@@ -21,7 +21,7 @@ pub use http::{
     HttpServiceState, OutboundHttpGrant,
 };
 pub use measurement::{PhaseTimings, RunMeasurement};
-pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder};
+pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder, RuntimeMetrics};
 pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
     WasiProfile, WasiVersion,

@@ -1,0 +1,97 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/fixtures/**"
+  push:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/fixtures/**"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Seconds to run each fuzz target
+        required: true
+        default: 900
+        type: number
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fuzz:
+    name: Runtime trust boundaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
+        with:
+          toolchain: nightly-2026-07-01
+
+      - name: Restore Rust fuzz cache
+        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          cache-on-failure: true
+          cache-bin: true
+          shared-key: fuzz
+          workspaces: |
+            . -> target
+            fuzz -> target
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Select fuzz duration
+        id: duration
+        env:
+          REQUESTED_SECONDS: ${{ inputs.duration_seconds }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.event_name }}" = "push" ]; then
+            echo "seconds=20" >> "$GITHUB_OUTPUT"
+          elif [ -n "$REQUESTED_SECONDS" ]; then
+            echo "seconds=$REQUESTED_SECONDS" >> "$GITHUB_OUTPUT"
+          else
+            echo "seconds=900" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo fuzz build
+
+      - name: Exercise runtime trust boundaries
+        working-directory: fuzz
+        env:
+          FUZZ_SECONDS: ${{ steps.duration.outputs.seconds }}
+        run: |
+          for target in component_admission http_capabilities disk_aot_corruption; do
+            cargo fuzz run "$target" -- \
+              -max_total_time="$FUZZ_SECONDS" \
+              -timeout=15 \
+              -rss_limit_mb=4096
+          done

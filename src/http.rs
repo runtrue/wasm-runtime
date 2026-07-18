@@ -462,6 +462,7 @@ impl HttpRequest {
 
 /// Buffered response returned by a standard WASI HTTP handler.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HttpResponse {
     /// HTTP status code.
     pub status: u16,
@@ -479,6 +480,7 @@ pub struct HttpResponse {
 
 /// Observable residency state for an HTTP service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HttpServiceState {
     /// No live guest instance is retained; the next request creates one.
     NoResidentWorker,
@@ -490,6 +492,7 @@ pub enum HttpServiceState {
 
 /// Point-in-time HTTP worker counters.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct HttpServiceMetrics {
     /// Workers created since service construction.
     pub workers_created: u64,
