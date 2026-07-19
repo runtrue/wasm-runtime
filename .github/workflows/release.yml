@@ -1,25 +1,12 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing annotated release tag, for example v0.1.0
-        required: true
-        type: string
-      publish_crate:
-        description: Publish the source package to crates.io
-        required: true
-        default: false
-        type: boolean
-      publish_confirmation:
-        description: To publish publicly, enter "publish <tag>" exactly
-        required: false
-        default: ""
-        type: string
+  push:
+    tags:
+      - "v*"
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -35,11 +22,12 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.package.outputs.version }}
+      publish_required: ${{ steps.registry.outputs.publish_required }}
     steps:
       - name: Check out the release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Install pinned Rust toolchain
@@ -47,13 +35,6 @@ jobs:
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
-
-      - name: Verify explicit public publication confirmation
-        if: inputs.publish_crate
-        env:
-          CONFIRMATION: ${{ inputs.publish_confirmation }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: test "$CONFIRMATION" = "publish $RELEASE_TAG"
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -63,7 +44,7 @@ jobs:
           shared-key: release
 
       - name: Verify source, tests, docs, version, and package
-        run: scripts/release-check.sh "${{ inputs.tag }}"
+        run: scripts/release-check.sh "${{ github.ref_name }}"
 
       - name: Install pinned SBOM generator
         run: cargo install cargo-cyclonedx --locked --version 0.5.9
@@ -82,6 +63,30 @@ jobs:
           (cd dist && sha256sum runtrue-wasm-runtime-* > SHA256SUMS)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Check crates.io for the tagged version
+        id: registry
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          index_entry="$RUNNER_TEMP/runtrue-wasm-runtime.index"
+          url="https://index.crates.io/ru/nt/runtrue-wasm-runtime"
+          status="$(curl --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            --header 'User-Agent: runtrue-wasm-runtime-release/0.1 (https://github.com/runtrue/wasm-runtime)' \
+            --output "$index_entry" --write-out '%{http_code}' "$url")"
+          case "$status" in
+            200)
+              if jq --exit-status --arg version "$VERSION" \
+                'select(.vers == $version)' "$index_entry" >/dev/null; then
+                echo "publish_required=false" >> "$GITHUB_OUTPUT"
+              else
+                echo "publish_required=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            404) echo "publish_required=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "crates.io index returned HTTP $status" >&2; exit 1 ;;
+          esac
+
       - name: Upload verified release bundle
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -91,7 +96,7 @@ jobs:
           retention-days: 14
 
   release:
-    name: Publish approved release
+    name: Publish tagged release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -104,10 +109,10 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.ref }}
 
       - name: Install pinned Rust toolchain
-        if: inputs.publish_crate
+        if: needs.build.outputs.publish_required == 'true'
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
         with:
           toolchain: 1.94.0
@@ -121,7 +126,7 @@ jobs:
       - name: Create or refresh draft GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -132,12 +137,12 @@ jobs:
           fi
 
       - name: Authenticate to crates.io with trusted publishing
-        if: inputs.publish_crate
+        if: needs.build.outputs.publish_required == 'true'
         id: crates_io
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish source package to crates.io
-        if: inputs.publish_crate
+        if: needs.build.outputs.publish_required == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io.outputs.token }}
         run: cargo publish --locked
@@ -151,4 +156,4 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ inputs.tag }}" --draft=false
+        run: gh release edit "${{ github.ref_name }}" --draft=false

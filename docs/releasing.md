@@ -1,10 +1,11 @@
 # Release process
 
-Releases are deliberately manual. Pushing a tag never publishes the crate by
-itself. GitHub Actions builds the exact tagged source, repeats all quality
-checks, verifies the Cargo source package, and produces a CycloneDX 1.5 SBOM
-and SHA-256 checksums. The `release` environment should be configured to
-require approval before the publication job can continue.
+Releases are tag-driven. Pushing a `v*` tag starts GitHub Actions, which builds
+the exact tagged source, repeats all quality checks, verifies the Cargo source
+package, and produces a CycloneDX 1.5 SBOM and SHA-256 checksums. If that
+version is not already on crates.io, the workflow publishes it through trusted
+publishing. The `release` environment should restrict deployments to release
+tags and require approval where the repository plan supports it.
 
 ## One-time repository configuration
 
@@ -17,9 +18,10 @@ require approval before the publication job can continue.
 3. Create a GitHub environment named `release`, add required reviewers, and
    prevent self-review where the organization plan supports it.
 4. Enable private vulnerability reporting and Dependabot security updates.
-5. Before the first crates.io publication, configure a crates.io trusted
-   publisher for repository `runtrue/wasm-runtime`, workflow `release.yml`, and
-   environment `release`. No long-lived registry token is needed.
+5. Publish the first crate version once with an owner-scoped crates.io token.
+   Then configure a trusted publisher for repository `runtrue/wasm-runtime`,
+   workflow `release.yml`, and environment `release`. No long-lived registry
+   token is used by GitHub Actions.
 
 GitHub artifact attestations are generated automatically once the repository
 is public. GitHub does not provide that feature to every private-repository
@@ -33,19 +35,19 @@ checksums and the SBOM are still included in the release bundle.
 2. Update the version in `Cargo.toml` and `Cargo.lock`.
 3. Move the changelog entries from `Unreleased` into a dated version heading.
 4. Run `scripts/release-check.sh` and merge the release pull request.
-5. Create and push a signed, annotated tag:
+5. For the first release only, publish the verified crate with an owner-scoped
+   token and configure the trusted publisher described above.
+6. Create and push a signed, annotated tag:
 
    ```text
    git tag -s v0.1.0 -m "runtrue-wasm-runtime 0.1.0"
    git push origin v0.1.0
    ```
 
-6. Run the `Release` workflow with that tag. Leave `publish_crate` disabled for
-   a private GitHub-only release. To enable it, enter `publish <tag>` in the
-   confirmation field only after approving permanent public source publication
-   to crates.io.
-7. Download the release assets, verify `SHA256SUMS`, and smoke-test the crate
+7. The tag starts the `Release` workflow. It publishes the crate only when the
+   tagged version is absent from crates.io, then publishes the GitHub release.
+8. Download the release assets, verify `SHA256SUMS`, and smoke-test the crate
    in a new empty consumer project before announcing it.
 
-Crates.io packages permanently expose their included source. Do not enable
-`publish_crate` while the source is intended to remain private.
+Crates.io packages permanently expose their included source. Do not push a
+release tag until public source publication is approved.
