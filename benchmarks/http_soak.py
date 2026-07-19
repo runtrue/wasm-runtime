@@ -174,9 +174,20 @@ def main() -> int:
             "host_os": platform.system().lower(),
             "host_arch": platform.machine(),
             "python": platform.python_version(),
-            "runtime_version": subprocess.check_output(
-                ["cargo", "pkgid"], cwd=ROOT, text=True
-            ).strip(),
+            "runtime_version": json.loads(
+                subprocess.check_output(
+                    [
+                        "cargo",
+                        "metadata",
+                        "--locked",
+                        "--no-deps",
+                        "--format-version",
+                        "1",
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                )
+            )["packages"][0]["version"],
             "server_ready": stdout.splitlines()[0] if stdout else None,
             "pid": process.pid,
         }

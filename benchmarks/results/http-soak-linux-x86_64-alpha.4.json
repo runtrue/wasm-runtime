@@ -15,7 +15,7 @@
   "host_os": "linux",
   "host_arch": "x86_64",
   "python": "3.14.4",
-  "runtime_version": "path+file:///root/.codex/worktrees/cd57/wasm-runtime#runtrue-wasm-runtime@0.1.0-alpha.4",
+  "runtime_version": "0.1.0-alpha.4",
   "server_ready": "listening=http://127.0.0.1:48927 startup_from=Cold startup_us=282516",
   "pid": 2878723
 }

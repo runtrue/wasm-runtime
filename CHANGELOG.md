@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-07-19
+
+### Changed
+
+- Prepared the repository, release documentation, and benchmark metadata for
+  public development.
+- Soak reports now record the crate version without embedding a local checkout
+  path.
+
 ## [0.1.0-alpha.4] - 2026-07-19
 
 ### Added
@@ -43,6 +52,7 @@ All notable changes to this project are documented here. The format follows
 - Direct-handler, TCP, capacity, cache eviction, timeout, and concurrent
   service benchmarks and tests.
 
-[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.4...HEAD
+[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.5...HEAD
+[0.1.0-alpha.5]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.4...v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/runtrue/wasm-runtime/releases/tag/v0.1.0-alpha.3

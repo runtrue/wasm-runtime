@@ -9,10 +9,8 @@ tags and require approval where the repository plan supports it.
 
 ## One-time repository configuration
 
-1. On a GitHub plan that supports private-repository rules, protect `main` and
-   require the `Rust quality and package`, `Dependency policy and advisories`,
-   and `Reproducible WASI fixtures` checks. Until then, merging is an owner-only
-   manual control and public release must be treated as blocked by policy.
+1. Protect `main` and require the `Rust quality and package`, `Dependency
+   policy and advisories`, and `Reproducible WASI fixtures` checks.
 2. Require pull requests, at least one approval, resolved conversations, and
    dismissal of stale approvals for security-sensitive changes.
 3. Create a GitHub environment named `release`, add required reviewers, and
@@ -23,10 +21,8 @@ tags and require approval where the repository plan supports it.
    workflow `release.yml`, and environment `release`. No long-lived registry
    token is used by GitHub Actions.
 
-GitHub artifact attestations are generated automatically once the repository
-is public. GitHub does not provide that feature to every private-repository
-plan, so the workflow skips the attestation while the repository is private;
-checksums and the SBOM are still included in the release bundle.
+GitHub artifact attestations are generated automatically for public releases;
+checksums and the SBOM are included in every release bundle.
 
 ## Cutting a release
 
@@ -49,5 +45,5 @@ checksums and the SBOM are still included in the release bundle.
 8. Download the release assets, verify `SHA256SUMS`, and smoke-test the crate
    in a new empty consumer project before announcing it.
 
-Crates.io packages permanently expose their included source. Do not push a
-release tag until public source publication is approved.
+Crates.io packages permanently expose their included source. Review the
+packaged source before pushing a release tag.

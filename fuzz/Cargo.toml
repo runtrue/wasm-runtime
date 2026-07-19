@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-runtrue-wasm-runtime = { path = "..", version = "=0.1.0-alpha.4" }
+runtrue-wasm-runtime = { path = "..", version = "=0.1.0-alpha.5" }
 tempfile = "=3.23.0"
 tokio = { version = "=1.51.1", features = ["rt", "time"] }
 
