@@ -3,9 +3,9 @@
 Releases are tag-driven. Pushing a `v*` tag starts GitHub Actions, which builds
 the exact tagged source, repeats all quality checks, verifies the Cargo source
 package, and produces a CycloneDX 1.5 SBOM and SHA-256 checksums. If that
-version is not already on crates.io, the workflow publishes it through trusted
-publishing. The `release` environment should restrict deployments to release
-tags and require approval where the repository plan supports it.
+version is not already on crates.io, the workflow publishes it with the
+`CRATES_APIKEY` secret. The `release` environment should restrict deployments
+to release tags and require approval where the repository plan supports it.
 
 ## One-time repository configuration
 
@@ -16,10 +16,10 @@ tags and require approval where the repository plan supports it.
 3. Create a GitHub environment named `release`, add required reviewers, and
    prevent self-review where the organization plan supports it.
 4. Enable private vulnerability reporting and Dependabot security updates.
-5. Publish the first crate version once with an owner-scoped crates.io token.
-   Then configure a trusted publisher for repository `runtrue/wasm-runtime`,
-   workflow `release.yml`, and environment `release`. No long-lived registry
-   token is used by GitHub Actions.
+5. Store a crates.io token as the `CRATES_APIKEY` secret. Restrict the token to
+   publishing `runtrue-wasm-runtime`, place it in the `release` environment or
+   make it available to this repository, and rotate it if disclosure is
+   suspected.
 
 GitHub artifact attestations are generated automatically for public releases;
 checksums and the SBOM are included in every release bundle.
@@ -31,8 +31,7 @@ checksums and the SBOM are included in every release bundle.
 2. Update the version in `Cargo.toml` and `Cargo.lock`.
 3. Move the changelog entries from `Unreleased` into a dated version heading.
 4. Run `scripts/release-check.sh` and merge the release pull request.
-5. For the first release only, publish the verified crate with an owner-scoped
-   token and configure the trusted publisher described above.
+5. Confirm that `CRATES_APIKEY` is available to the `release` environment.
 6. Create and push a signed, annotated tag:
 
    ```text

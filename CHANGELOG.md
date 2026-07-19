@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Tag-driven releases publish to crates.io with the protected
+  `CRATES_APIKEY` GitHub Actions secret.
+
 ### Fixed
 
 - Prerelease versions are marked as prereleases automatically when the
