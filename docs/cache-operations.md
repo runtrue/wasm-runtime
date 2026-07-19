@@ -73,3 +73,7 @@ durable tier is not receiving newly compiled entries.
 Two runtime processes may publish the same authenticated entry concurrently;
 unique temporary names and atomic renames leave a loadable final pair. Do not
 run external cleanup concurrently with those writers.
+
+Cache authentication protects native artifacts; it does not replace the
+[runtime capability model](security.md) or the
+[production process boundary](production-isolation.md).

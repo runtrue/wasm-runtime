@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -78,25 +78,12 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid limits or when the Wasmtime engine,
-    /// standard linkers, disk cache, or epoch watchdog cannot be initialized.
+    /// Returns an error for invalid limits or when the Wasmtime engine, disk
+    /// cache, or epoch watchdog cannot be initialized. The selected standard
+    /// linker is initialized lazily when a component is first invoked.
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         validate_config(&config)?;
         let engine = Engine::new(&engine_config())
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        let mut p3_linker = Linker::new(&engine);
-        wasmtime_wasi::p3::add_to_linker(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        // Preview 3 components produced through the current preview 1 adapter
-        // may still import preview 2 CLI interfaces alongside their p3 export.
-        wasmtime_wasi::p2::add_to_linker_async(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        wasmtime_wasi_http::p3::add_to_linker(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        let mut p2_linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut p2_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut p2_linker)
             .map_err(|error| Error::Configuration(error.to_string()))?;
         let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
         let disk = config
@@ -114,8 +101,8 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 engine,
-                p3_linker,
-                p2_linker,
+                p3_linker: OnceLock::new(),
+                p2_linker: OnceLock::new(),
                 memory: Mutex::new(MemoryCache::new(&config)),
                 preparation_locks: Mutex::new(HashMap::new()),
                 disk,
@@ -451,8 +438,8 @@ impl Drop for RunningCommand {
 
 pub(crate) struct RuntimeInner {
     pub(crate) engine: Engine,
-    pub(crate) p3_linker: Linker<HostState>,
-    pub(crate) p2_linker: Linker<HostState>,
+    p3_linker: OnceLock<std::result::Result<Linker<HostState>, Error>>,
+    p2_linker: OnceLock<std::result::Result<Linker<HostState>, Error>>,
     memory: Mutex<MemoryCache>,
     preparation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     disk: Option<DiskCache>,
@@ -464,6 +451,20 @@ pub(crate) struct RuntimeInner {
 }
 
 impl RuntimeInner {
+    pub(crate) fn p3_linker(&self) -> Result<&Linker<HostState>> {
+        self.p3_linker
+            .get_or_init(|| build_p3_linker(&self.engine))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(crate) fn p2_linker(&self) -> Result<&Linker<HostState>> {
+        self.p2_linker
+            .get_or_init(|| build_p2_linker(&self.engine))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     pub(crate) fn demote(&self, digest: &str) {
         if let Ok(mut memory) = self.memory.lock() {
             memory.demote(digest);
@@ -683,7 +684,7 @@ impl RuntimeInner {
                 let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
-                    &self.p3_linker,
+                    self.p3_linker()?,
                 )
                 .await
                 .map_err(|error| Error::Execution(error.to_string()))?;
@@ -710,7 +711,7 @@ impl RuntimeInner {
                 let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
-                    &self.p2_linker,
+                    self.p2_linker()?,
                 )
                 .await
                 .map_err(|error| Error::Execution(error.to_string()))?;
@@ -954,6 +955,28 @@ fn detect_profile(engine: &Engine, component: &Component) -> Result<WasiProfile>
             "component exports more than one supported WASI world".to_owned(),
         )),
     }
+}
+
+fn build_p3_linker(engine: &Engine) -> Result<Linker<HostState>> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p3::add_to_linker(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    // Preview 3 components produced through the current preview 1 adapter may
+    // still import preview 2 CLI interfaces alongside their p3 export.
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    Ok(linker)
+}
+
+fn build_p2_linker(engine: &Engine) -> Result<Linker<HostState>> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    Ok(linker)
 }
 
 fn engine_config() -> Config {

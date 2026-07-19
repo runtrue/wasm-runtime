@@ -1,5 +1,9 @@
 # Runtime performance comparison
 
+Historical direct-handler and capacity comparison collected for alpha.4 on
+2026-07-18. It does not include the later streaming HTTP fast path. Baseline
+and candidate raw JSON are retained beside this report.
+
 Thresholds are alert-only unless enforcement is selected.
 Latency changes below 25 microseconds are treated as timer/runner noise.
 

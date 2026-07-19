@@ -12,9 +12,9 @@ SHA-256 is `f6871cc812bb5102105f9498c2a135d4cf08969dd9a2d58f514a2a32d69b6681`.
 
 Additional standard fixtures from the same tag and license:
 
-- `p3-http-proxy.component.wasm` from `p3_http_proxy.rs`, SHA-256 recorded by
+- `p3-http-proxy.component.wasm` from `p3_http_proxy.rs`, SHA-256
   `f09271ee8f359790ec2c606dceb591912d1155156c1bc2f5c168f4957c669e4b`.
-- `p3-http-sleep.component.wasm` from `p3_cli_serve_sleep.rs`, SHA-256 recorded
+- `p3-http-sleep.component.wasm` from `p3_cli_serve_sleep.rs`, SHA-256
   `40114ffe2db05d91bb5ae27de49306f3df4e29bdb2efb86ec5c26c7c84b49060`.
 
 `json-http-tool.component.wasm` is built from this repository's

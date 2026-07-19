@@ -6,10 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0-alpha.4] - 2026-07-18
+## [0.1.0-alpha.4] - 2026-07-19
 
 ### Added
 
+- A bounded streaming HTTP host API that avoids request and response rebuilding
+  while preserving admission, timeout, capability, metric, and body limits.
+  Inline dispatch metadata reports request ID, admission tier, worker creation,
+  and time to response headers for control-plane correlation.
 - Failure-containment, cache-operations, package-consumer, and fuzz release
   gates for untrusted components and authenticated native artifacts.
 - Alert-first performance regression collection with raw host metadata and a
@@ -18,6 +22,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Standard WASI linkers are initialized on first use for the selected profile,
+  reducing process-to-ready work without changing component behavior.
+- TCP comparisons rotate runner order to reduce cache-heat and CPU-boost bias.
 - Public state and error enums are non-exhaustive so new standards versions
   and lifecycle states can be added compatibly.
 

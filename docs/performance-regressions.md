@@ -11,6 +11,7 @@ resident RSS, marginal worker RSS, and workers per GiB. Current alert thresholds
 are 30% for latency and throughput, 25% for memory, and 5% for artifact size.
 Latency changes smaller than 25 microseconds are treated as measurement noise
 even when their relative percentage is large.
+
 Actual TCP results for raw embedding, the standard Wasmtime CLI, and this
 package are collected as a separate artifact rather than mixed with direct
 handler thresholds.

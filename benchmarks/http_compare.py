@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = ROOT / "tests/fixtures/p2-http-hello.component.wasm"
 TOOLS = ROOT / ".benchmark-tools"
+RUNNERS = ("raw-wasmtime-embedding", "wasmtime-serve", "standalone-package")
 
 
 def percentile(samples: list[int], percent: int) -> int:
@@ -194,9 +195,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cold-iterations", type=int, default=5)
     parser.add_argument("--warm-requests", type=int, default=200)
+    parser.add_argument(
+        "--runner-order",
+        default=",".join(RUNNERS),
+        help="comma-separated permutation used to control benchmark order",
+    )
     args = parser.parse_args()
     if args.cold_iterations < 1 or args.warm_requests < 1:
         parser.error("sample counts must be positive")
+    runner_order = tuple(args.runner_order.split(","))
+    if len(runner_order) != len(RUNNERS) or set(runner_order) != set(RUNNERS):
+        parser.error("--runner-order must contain each known runner exactly once")
     required = [TOOLS / "wasmtime", ROOT / "target/release/examples/http_server", ROOT / "target/release/examples/raw_wasmtime_http_server"]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -218,10 +227,14 @@ def main() -> None:
             "max_instance_reuse_count": 10_000,
             "idle_instance_timeout_seconds": 30,
             "tcp_mode": "HTTP/1.1 loopback; fresh-connection and keep-alive measured separately",
+            "runner_order": runner_order,
         },
         "cold_iterations": args.cold_iterations,
         "warm_requests": args.warm_requests,
-        "runners": [benchmark(name, args.cold_iterations, args.warm_requests) for name in ("raw-wasmtime-embedding", "wasmtime-serve", "standalone-package")],
+        "runners": [
+            benchmark(name, args.cold_iterations, args.warm_requests)
+            for name in runner_order
+        ],
     }
     print(json.dumps(report, indent=2))
 

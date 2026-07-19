@@ -26,3 +26,6 @@ The template in `deploy/systemd/runtrue-wasm-host.service` demonstrates the
 minimum Linux process restrictions for an embedding host. Its executable name,
 network policy, memory limit, and writable cache path are deployment inputs;
 the crate does not install a service by itself.
+
+Apply the runtime-level rules in the [security and capability model](security.md)
+inside this OS boundary. Neither layer replaces the other.

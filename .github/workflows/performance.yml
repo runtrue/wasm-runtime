@@ -71,6 +71,12 @@ jobs:
           uv run benchmarks/bootstrap_tools.py
           uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000 \
             > performance/http-tcp.json
+          uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000 \
+            --runner-order standalone-package,raw-wasmtime-embedding,wasmtime-serve \
+            > performance/http-tcp-standalone-first.json
+          uv run benchmarks/http_compare.py --cold-iterations 20 --warm-requests 1000 \
+            --runner-order wasmtime-serve,standalone-package,raw-wasmtime-embedding \
+            > performance/http-tcp-serve-first.json
 
       - name: Record runner metadata
         env:

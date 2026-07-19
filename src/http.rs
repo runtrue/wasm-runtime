@@ -3,7 +3,8 @@ use crate::{
     runtime::{HostState, PreparedComponent, RuntimeInner},
 };
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
+use http_body_util::{BodyExt as _, Full, Limited, combinators::UnsyncBoxBody};
+use hyper::body::{Body, Frame, SizeHint};
 use std::{
     future::Future,
     pin::Pin,
@@ -14,7 +15,7 @@ use std::{
     task::{Context, Poll, ready},
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wasmtime::{Store, StoreContextMut, StoreLimitsBuilder, component::GuestTaskId};
 use wasmtime_wasi_http::handler::{
     self, HandlerState, Instance, ProxyHandler, ProxyPre, ShouldAccept, ViewFn, WorkerExpiration,
@@ -478,6 +479,97 @@ pub struct HttpResponse {
     pub worker_created: bool,
 }
 
+/// Allocation-free per-request telemetry for the streaming HTTP path.
+///
+/// A control plane can read this from [`StreamingHttpBody::metadata`] before
+/// handing the response body to its network server. Request identifiers are
+/// monotonically increasing and unique within one [`HttpService`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct HttpDispatchMetadata {
+    /// Service-local request identifier passed to the WASI HTTP handler.
+    pub request_id: u64,
+    /// Package tier observed when the request entered the service.
+    pub package_tier: PackageTier,
+    /// Whether at least one new worker was created while producing headers.
+    pub worker_created: bool,
+    /// Time from entering the service until response headers were available.
+    pub headers_elapsed: Duration,
+}
+
+/// Streaming response body returned by [`HttpService::handle_streaming`].
+///
+/// The body keeps its service admission permit until it is fully consumed or
+/// dropped. Response bytes are bounded by the runtime output limit without
+/// buffering or reconstructing the response.
+pub struct StreamingHttpBody {
+    inner: UnsyncBoxBody<Bytes, wasmtime::Error>,
+    remaining: usize,
+    completion: Option<HttpRequestCompletion>,
+    metadata: HttpDispatchMetadata,
+}
+
+impl std::fmt::Debug for StreamingHttpBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamingHttpBody")
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamingHttpBody {
+    /// Per-request tier, worker, identifier, and header timing telemetry.
+    #[must_use]
+    pub const fn metadata(&self) -> HttpDispatchMetadata {
+        self.metadata
+    }
+}
+
+impl Body for StreamingHttpBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        match Pin::new(&mut body.inner).poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if data.len() > body.remaining {
+                        body.remaining = 0;
+                        body.completion.take();
+                        return Poll::Ready(Some(Err(Error::Limit("output bytes"))));
+                    }
+                    body.remaining -= data.len();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                body.completion.take();
+                Poll::Ready(Some(Err(Error::Execution(error.to_string()))))
+            }
+            Poll::Ready(None) => {
+                if let Some(completion) = body.completion.take() {
+                    completion.complete();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Observable residency state for an HTTP service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -512,7 +604,7 @@ pub struct HttpService {
     handler: ProxyHandler<HttpHandlerState>,
     admission: Arc<Semaphore>,
     metrics: Arc<HttpMetrics>,
-    program: Program,
+    package_tier: Arc<AtomicUsize>,
     profile: WasiProfile,
     startup_from: PackageTier,
     startup_prepare: Duration,
@@ -561,6 +653,7 @@ impl Program {
         let pre = make_proxy_pre(&self.runtime.inner, &prepared)?;
         let metrics = Arc::new(HttpMetrics::default());
         let pre_slot = Arc::new(Mutex::new(Some(Arc::new(pre))));
+        let package_tier = Arc::new(AtomicUsize::new(package_tier_code(PackageTier::Warm)));
         let state = HttpHandlerState {
             runtime: Arc::clone(&self.runtime.inner),
             digest: self.digest.clone(),
@@ -569,13 +662,14 @@ impl Program {
             profile: prepared.profile,
             config: config.clone(),
             metrics: Arc::clone(&metrics),
+            package_tier: Arc::clone(&package_tier),
             next_request: AtomicU64::new(1),
         };
         Ok(HttpService {
             handler: ProxyHandler::new(state),
             admission: Arc::new(Semaphore::new(config.max_in_flight)),
             metrics,
-            program: self.clone(),
+            package_tier,
             profile: prepared.profile,
             startup_from,
             startup_prepare,
@@ -612,7 +706,7 @@ impl HttpService {
     /// Current package code tier.
     #[must_use]
     pub fn package_tier(&self) -> PackageTier {
-        self.program.tier()
+        package_tier_from_code(self.package_tier.load(Ordering::Relaxed))
     }
 
     /// Current worker residency state.
@@ -650,14 +744,15 @@ impl HttpService {
         if request.body.len() > self.handler.state().runtime.config.limits.max_input_bytes {
             return Err(Error::Limit("input bytes"));
         }
-        let permit = Arc::clone(&self.admission)
-            .acquire_owned()
+        let permit = self
+            .admission
+            .acquire()
             .await
             .map_err(|_| Error::InvalidState("HTTP service is closed"))?;
         let started = Instant::now();
         let tier = self.package_tier();
-        let workers_before = self.metrics.workers_created.load(Ordering::Acquire);
-        self.metrics.in_flight.fetch_add(1, Ordering::AcqRel);
+        let workers_before = self.metrics.workers_created.load(Ordering::Relaxed);
+        self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
         let request = build_request(request)?;
         let id = self
             .handler
@@ -665,7 +760,7 @@ impl HttpService {
             .next_request
             .fetch_add(1, Ordering::Relaxed);
         let response = self.handler.handle(id, request).await;
-        self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
         drop(permit);
         let response = response.map_err(|error| Error::Execution(error.to_string()))?;
         let (parts, body) = response.into_parts();
@@ -679,7 +774,7 @@ impl HttpService {
         }
         self.metrics
             .completed_requests
-            .fetch_add(1, Ordering::AcqRel);
+            .fetch_add(1, Ordering::Relaxed);
         Ok(HttpResponse {
             status: parts.status.as_u16(),
             headers: parts
@@ -690,8 +785,136 @@ impl HttpService {
             body: body.to_vec(),
             elapsed: started.elapsed(),
             package_tier: tier,
-            worker_created: self.metrics.workers_created.load(Ordering::Acquire) > workers_before,
+            worker_created: self.metrics.workers_created.load(Ordering::Relaxed) > workers_before,
         })
+    }
+
+    /// Dispatch a standard HTTP request without buffering or reconstructing
+    /// its body, headers, URI, or response.
+    ///
+    /// This is the low-overhead host integration path. It preserves admission,
+    /// guest timeouts, worker reuse, capability enforcement, metrics, and
+    /// request/response byte limits. The returned body must be consumed or
+    /// dropped to release its admission permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for admission shutdown, guest instantiation, traps, or
+    /// failure to produce response headers. Streaming body failures are
+    /// reported by [`StreamingHttpBody`].
+    pub async fn handle_streaming<B>(
+        &self,
+        request: http::Request<B>,
+    ) -> Result<http::Response<StreamingHttpBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let started = Instant::now();
+        let package_tier = self.package_tier();
+        let max_input_bytes = self.handler.state().runtime.config.limits.max_input_bytes;
+        let max_input_u64 = u64::try_from(max_input_bytes).unwrap_or(u64::MAX);
+        let size_hint = request.body().size_hint();
+        if size_hint.lower() > max_input_u64
+            || size_hint.upper().is_some_and(|upper| upper > max_input_u64)
+        {
+            return Err(Error::Limit("input bytes"));
+        }
+        let request = request.map(|body| {
+            Limited::new(body, max_input_bytes)
+                .map_err(streaming_request_error)
+                .boxed_unsync()
+        });
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::InvalidState("HTTP service is closed"))?;
+        self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        let completion = HttpRequestCompletion {
+            metrics: Arc::clone(&self.metrics),
+            _permit: permit,
+        };
+        let workers_before = self.metrics.workers_created.load(Ordering::Relaxed);
+        let id = self
+            .handler
+            .state()
+            .next_request
+            .fetch_add(1, Ordering::Relaxed);
+        let response = match self.handler.handle(id, request).await {
+            Ok(response) => response,
+            Err(error) => {
+                drop(completion);
+                return Err(Error::Execution(error.to_string()));
+            }
+        };
+        let metadata = HttpDispatchMetadata {
+            request_id: id,
+            package_tier,
+            worker_created: self.metrics.workers_created.load(Ordering::Relaxed) > workers_before,
+            headers_elapsed: started.elapsed(),
+        };
+        let max_output_bytes = self.handler.state().runtime.config.limits.max_output_bytes;
+        Ok(response.map(|body| {
+            let mut completion = Some(completion);
+            if body.is_end_stream()
+                && let Some(completion) = completion.take()
+            {
+                completion.complete();
+            }
+            StreamingHttpBody {
+                inner: body,
+                remaining: max_output_bytes,
+                completion,
+                metadata,
+            }
+        }))
+    }
+}
+
+fn streaming_request_error(error: Box<dyn std::error::Error + Send + Sync>) -> handler::ErrorCode {
+    use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+    let error = match error.downcast::<http_body_util::LengthLimitError>() {
+        Ok(_) => ErrorCode::HttpRequestBodySize(None),
+        Err(error) => ErrorCode::InternalError(Some(error.to_string())),
+    };
+    error.into()
+}
+
+struct HttpRequestCompletion {
+    metrics: Arc<HttpMetrics>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl HttpRequestCompletion {
+    fn complete(self) {
+        self.metrics
+            .completed_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for HttpRequestCompletion {
+    fn drop(&mut self) {
+        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+const fn package_tier_code(tier: PackageTier) -> usize {
+    match tier {
+        PackageTier::Cold => 0,
+        PackageTier::DiskAot => 1,
+        PackageTier::Warmish => 2,
+        PackageTier::Warm => 3,
+    }
+}
+
+const fn package_tier_from_code(code: usize) -> PackageTier {
+    match code {
+        0 => PackageTier::Cold,
+        1 => PackageTier::DiskAot,
+        2 => PackageTier::Warmish,
+        _ => PackageTier::Warm,
     }
 }
 
@@ -716,8 +939,8 @@ fn make_proxy_pre(
     prepared: &PreparedComponent,
 ) -> Result<ProxyPre<HostState>> {
     let instance = match prepared.profile {
-        WasiProfile::Http0_3 => runtime.p3_linker.instantiate_pre(&prepared.component),
-        WasiProfile::Http0_2 => runtime.p2_linker.instantiate_pre(&prepared.component),
+        WasiProfile::Http0_3 => runtime.p3_linker()?.instantiate_pre(&prepared.component),
+        WasiProfile::Http0_2 => runtime.p2_linker()?.instantiate_pre(&prepared.component),
         WasiProfile::Cli0_3 | WasiProfile::Cli0_2 => unreachable!("validated above"),
     }
     .map_err(|error| Error::Preparation(error.to_string()))?;
@@ -749,6 +972,7 @@ struct HttpHandlerState {
     profile: WasiProfile,
     config: HttpServiceConfig,
     metrics: Arc<HttpMetrics>,
+    package_tier: Arc<AtomicUsize>,
     next_request: AtomicU64,
 }
 
@@ -806,6 +1030,8 @@ impl HandlerState for HttpHandlerState {
         // Store independently.
         store.set_epoch_deadline(u64::MAX / 2);
         let proxy = pre.instantiate_async(&mut store).await?;
+        self.package_tier
+            .store(package_tier_code(PackageTier::Warm), Ordering::Relaxed);
         self.metrics.workers_created.fetch_add(1, Ordering::AcqRel);
         self.metrics.live_workers.fetch_add(1, Ordering::AcqRel);
         let idle_expired = Arc::new(AtomicBool::new(false));
@@ -836,6 +1062,7 @@ impl HandlerState for HttpHandlerState {
                 runtime: Arc::clone(&self.runtime),
                 digest: self.digest.clone(),
                 pre: Arc::clone(&self.pre),
+                package_tier: Arc::clone(&self.package_tier),
             },
         })
     }
@@ -888,6 +1115,7 @@ struct HttpWorkerState {
     runtime: Arc<RuntimeInner>,
     digest: String,
     pre: Arc<Mutex<Option<Arc<ProxyPre<HostState>>>>>,
+    package_tier: Arc<AtomicUsize>,
 }
 
 impl WorkerState for HttpWorkerState {
@@ -920,6 +1148,8 @@ impl WorkerState for HttpWorkerState {
             self.metrics.idle_evictions.fetch_add(1, Ordering::AcqRel);
             *self.pre.lock().expect("HTTP pre lock poisoned") = None;
             self.runtime.demote(&self.digest);
+            self.package_tier
+                .store(package_tier_code(PackageTier::Warmish), Ordering::Relaxed);
         }
     }
 }
