@@ -52,11 +52,9 @@ jobs:
 
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
-        with:
-          toolchain: nightly-2026-07-01
 
       - name: Restore Rust fuzz cache
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
           cache-bin: true
