@@ -30,11 +30,10 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
         with:
-          toolchain: 1.94.0
           components: rustfmt, clippy
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
           shared-key: ci-quality
@@ -75,11 +74,9 @@ jobs:
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
-        with:
-          toolchain: 1.94.0
 
       - name: Restore Rust audit cache
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: true
           shared-key: ci-audit
@@ -114,11 +111,10 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
         with:
-          toolchain: 1.94.0
           targets: wasm32-wasip1, wasm32-wasip2
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
           shared-key: ci-fixtures
@@ -131,8 +127,6 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@1e862dfacbd1d6d858c55d9b792c756523627244 # v7.1.4
-        with:
-          enable-cache: true
 
       - name: Rebuild standard fixtures
         run: |
