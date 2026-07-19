@@ -128,6 +128,7 @@ async fn multiple_services_sustain_concurrent_requests_with_bounded_workers() {
     }
     assert_eq!(completed, 256);
     for service in services {
-        assert!(service.metrics().live_workers <= 8);
+        let metrics = service.metrics();
+        assert!(metrics.live_workers <= 8, "unexpected metrics: {metrics:?}");
     }
 }

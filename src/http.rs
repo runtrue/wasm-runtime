@@ -744,15 +744,18 @@ impl HttpService {
         if request.body.len() > self.handler.state().runtime.config.limits.max_input_bytes {
             return Err(Error::Limit("input bytes"));
         }
-        let permit = self
-            .admission
-            .acquire()
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
             .await
             .map_err(|_| Error::InvalidState("HTTP service is closed"))?;
         let started = Instant::now();
         let tier = self.package_tier();
         let workers_before = self.metrics.workers_created.load(Ordering::Relaxed);
         self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        let completion = HttpRequestCompletion {
+            metrics: Arc::clone(&self.metrics),
+            _permit: permit,
+        };
         let request = build_request(request)?;
         let id = self
             .handler
@@ -760,8 +763,6 @@ impl HttpService {
             .next_request
             .fetch_add(1, Ordering::Relaxed);
         let response = self.handler.handle(id, request).await;
-        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
-        drop(permit);
         let response = response.map_err(|error| Error::Execution(error.to_string()))?;
         let (parts, body) = response.into_parts();
         let body = body
@@ -772,9 +773,7 @@ impl HttpService {
         if body.len() > self.handler.state().runtime.config.limits.max_output_bytes {
             return Err(Error::Limit("output bytes"));
         }
-        self.metrics
-            .completed_requests
-            .fetch_add(1, Ordering::Relaxed);
+        completion.complete();
         Ok(HttpResponse {
             status: parts.status.as_u16(),
             headers: parts
