@@ -1,0 +1,69 @@
+{
+  "schema": "standalone-wasm-http-capacity-v1",
+  "host_os": "linux",
+  "host_arch": "x86_64",
+  "wasmtime_version": "46.0.1",
+  "wasi_profile": "wasi:http/service@0.3.0",
+  "source_component_bytes": 140559,
+  "authenticated_aot_bytes": 832024,
+  "package_storage": [
+    {
+      "packages": 1,
+      "identical_digest_aot_bytes": 832024,
+      "unique_digest_aot_projection_bytes": 832024,
+      "source_projection_bytes": 140559
+    },
+    {
+      "packages": 100,
+      "identical_digest_aot_bytes": 832024,
+      "unique_digest_aot_projection_bytes": 83202400,
+      "source_projection_bytes": 14055900
+    },
+    {
+      "packages": 1000,
+      "identical_digest_aot_bytes": 832024,
+      "unique_digest_aot_projection_bytes": 832024000,
+      "source_projection_bytes": 140559000
+    },
+    {
+      "packages": 10000,
+      "identical_digest_aot_bytes": 832024,
+      "unique_digest_aot_projection_bytes": 8320240000,
+      "source_projection_bytes": 1405590000
+    }
+  ],
+  "resident_workers": [
+    {
+      "workers": 1,
+      "measured": true,
+      "rss_bytes": 26386432,
+      "rss_delta_bytes": 16404480
+    },
+    {
+      "workers": 100,
+      "measured": true,
+      "rss_bytes": 32391168,
+      "rss_delta_bytes": 22409216
+    },
+    {
+      "workers": 1000,
+      "measured": true,
+      "rss_bytes": 86683648,
+      "rss_delta_bytes": 76701696
+    },
+    {
+      "workers": 10000,
+      "measured": true,
+      "rss_bytes": 629252096,
+      "rss_delta_bytes": 619270144
+    }
+  ],
+  "worker_projection_basis": {
+    "measured_workers": 10000,
+    "runtime_baseline_rss_bytes": 9981952,
+    "one_worker_rss_bytes": 26386432,
+    "measured_rss_bytes": 629252096,
+    "marginal_rss_per_worker_bytes": 60292,
+    "projected_workers_per_gib": 17809
+  }
+}

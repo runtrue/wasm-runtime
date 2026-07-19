@@ -4,6 +4,7 @@ use std::time::Duration;
 
 /// Timings for the major phases of an invocation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PhaseTimings {
     /// Time spent locating, authenticating, compiling, or deserializing code.
     pub prepare: Duration,
@@ -21,6 +22,7 @@ pub struct PhaseTimings {
 
 /// Tier and timing evidence for one invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RunMeasurement {
     /// Tier observed before preparation started.
     pub prepared_from: PackageTier,

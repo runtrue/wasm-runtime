@@ -1,11 +1,97 @@
 //! Standard WASI HTTP worker residency integration test.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt as _, Full};
 use runtrue_wasm_runtime::{
-    HttpRequest, HttpServiceConfig, HttpServiceState, PackageTier, Runtime, WasiProfile,
+    Error, HttpRequest, HttpServiceConfig, HttpServiceState, PackageTier, Runtime, RuntimeConfig,
+    RuntimeLimits, WasiProfile,
 };
 use std::time::Duration;
 
 const HTTP_COMPONENT: &[u8] = include_bytes!("fixtures/p3-http-hello.component.wasm");
+
+#[tokio::test]
+async fn streaming_path_preserves_http_parts_and_completes_metrics() {
+    let runtime = Runtime::with_defaults().expect("runtime");
+    let program = runtime.load_bytes(HTTP_COMPONENT).expect("component");
+    let service = program
+        .http_service(HttpServiceConfig::default())
+        .await
+        .expect("HTTP service");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/tools/call")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .expect("request");
+
+    let response = service
+        .handle_streaming(request)
+        .await
+        .expect("streaming response");
+    assert_eq!(response.status(), 200);
+    let metadata = response.body().metadata();
+    assert_eq!(metadata.request_id, 1);
+    assert_eq!(metadata.package_tier, PackageTier::Warm);
+    assert!(metadata.worker_created);
+    assert!(!metadata.headers_elapsed.is_zero());
+    assert_eq!(service.metrics().in_flight, 1);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    assert_eq!(body, b"Hello, WASI!".as_slice());
+    assert_eq!(service.metrics().in_flight, 0);
+    assert_eq!(service.metrics().completed_requests, 1);
+}
+
+#[tokio::test]
+async fn streaming_path_enforces_input_and_output_limits() {
+    let runtime = Runtime::new(RuntimeConfig {
+        limits: RuntimeLimits {
+            max_input_bytes: 1,
+            max_output_bytes: 5,
+            ..RuntimeLimits::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    let service = runtime
+        .load_bytes(HTTP_COMPONENT)
+        .expect("component")
+        .http_service(HttpServiceConfig::default())
+        .await
+        .expect("HTTP service");
+
+    let oversized = http::Request::builder()
+        .uri("http://localhost/")
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .expect("request");
+    let input_error = service
+        .handle_streaming(oversized)
+        .await
+        .expect_err("oversized input");
+    assert!(matches!(input_error, Error::Limit("input bytes")));
+
+    let request = http::Request::builder()
+        .uri("http://localhost/")
+        .body(Full::new(Bytes::new()))
+        .expect("request");
+    let response = service
+        .handle_streaming(request)
+        .await
+        .expect("response headers");
+    let output_error = response
+        .into_body()
+        .collect()
+        .await
+        .expect_err("oversized output");
+    assert!(matches!(output_error, Error::Limit("output bytes")));
+    assert_eq!(service.metrics().in_flight, 0);
+    assert_eq!(service.metrics().completed_requests, 0);
+}
 
 #[tokio::test]
 async fn reuses_then_evicts_idle_http_worker() {
@@ -57,10 +143,21 @@ async fn reuses_then_evicts_idle_http_worker() {
     assert_eq!(service.package_tier(), PackageTier::Warmish);
 
     let restarted = service
-        .handle(HttpRequest::new("GET", "http://localhost/", Vec::new()))
+        .handle_streaming(
+            http::Request::builder()
+                .uri("http://localhost/")
+                .body(Full::new(Bytes::new()))
+                .expect("request"),
+        )
         .await
         .expect("warmish restart");
-    assert!(restarted.worker_created);
-    assert_eq!(restarted.package_tier, PackageTier::Warmish);
+    let metadata = restarted.body().metadata();
+    assert!(metadata.worker_created);
+    assert_eq!(metadata.package_tier, PackageTier::Warmish);
+    restarted
+        .into_body()
+        .collect()
+        .await
+        .expect("restarted body");
     assert_eq!(service.metrics().workers_created, 2);
 }

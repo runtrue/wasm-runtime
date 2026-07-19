@@ -6,11 +6,10 @@ use crate::{
 use bytes::Bytes;
 use std::{
     collections::HashMap,
-    future::Future,
     path::Path,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -59,6 +58,15 @@ pub struct Runtime {
     pub(crate) inner: Arc<RuntimeInner>,
 }
 
+/// Point-in-time operational counters for a [`Runtime`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeMetrics {
+    /// Compiled AOT artifacts that could not be persisted to the optional disk
+    /// cache. The in-memory warm and warmish entries remain usable.
+    pub disk_publish_failures: u64,
+}
+
 impl std::fmt::Debug for Runtime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("Runtime").finish_non_exhaustive()
@@ -70,25 +78,12 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid limits or when the Wasmtime engine,
-    /// standard linkers, disk cache, or epoch watchdog cannot be initialized.
+    /// Returns an error for invalid limits or when the Wasmtime engine, disk
+    /// cache, or epoch watchdog cannot be initialized. The selected standard
+    /// linker is initialized lazily when a component is first invoked.
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         validate_config(&config)?;
         let engine = Engine::new(&engine_config())
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        let mut p3_linker = Linker::new(&engine);
-        wasmtime_wasi::p3::add_to_linker(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        // Preview 3 components produced through the current preview 1 adapter
-        // may still import preview 2 CLI interfaces alongside their p3 export.
-        wasmtime_wasi::p2::add_to_linker_async(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        wasmtime_wasi_http::p3::add_to_linker(&mut p3_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        let mut p2_linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut p2_linker)
-            .map_err(|error| Error::Configuration(error.to_string()))?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut p2_linker)
             .map_err(|error| Error::Configuration(error.to_string()))?;
         let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
         let disk = config
@@ -106,12 +101,13 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 engine,
-                p3_linker,
-                p2_linker,
+                p3_linker: OnceLock::new(),
+                p2_linker: OnceLock::new(),
                 memory: Mutex::new(MemoryCache::new(&config)),
                 preparation_locks: Mutex::new(HashMap::new()),
                 disk,
                 background: Arc::new(Semaphore::new(background_workers)),
+                disk_publish_failures: AtomicU64::new(0),
                 stop_epoch,
                 epoch_thread: Some(epoch_thread),
                 config,
@@ -126,6 +122,14 @@ impl Runtime {
     /// Returns an error when runtime initialization fails.
     pub fn with_defaults() -> Result<Self> {
         RuntimeBuilder::new().build()
+    }
+
+    /// Read point-in-time operational counters shared by all runtime clones.
+    #[must_use]
+    pub fn metrics(&self) -> RuntimeMetrics {
+        RuntimeMetrics {
+            disk_publish_failures: self.inner.disk_publish_failures.load(Ordering::Relaxed),
+        }
     }
 
     /// Load component bytes and schedule bounded background promotion when
@@ -434,18 +438,33 @@ impl Drop for RunningCommand {
 
 pub(crate) struct RuntimeInner {
     pub(crate) engine: Engine,
-    pub(crate) p3_linker: Linker<HostState>,
-    pub(crate) p2_linker: Linker<HostState>,
+    p3_linker: OnceLock<std::result::Result<Linker<HostState>, Error>>,
+    p2_linker: OnceLock<std::result::Result<Linker<HostState>, Error>>,
     memory: Mutex<MemoryCache>,
     preparation_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     disk: Option<DiskCache>,
     background: Arc<Semaphore>,
+    disk_publish_failures: AtomicU64,
     stop_epoch: Arc<AtomicBool>,
     epoch_thread: Option<thread::JoinHandle<()>>,
     pub(crate) config: RuntimeConfig,
 }
 
 impl RuntimeInner {
+    pub(crate) fn p3_linker(&self) -> Result<&Linker<HostState>> {
+        self.p3_linker
+            .get_or_init(|| build_p3_linker(&self.engine))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(crate) fn p2_linker(&self) -> Result<&Linker<HostState>> {
+        self.p2_linker
+            .get_or_init(|| build_p2_linker(&self.engine))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     pub(crate) fn demote(&self, digest: &str) {
         if let Ok(mut memory) = self.memory.lock() {
             memory.demote(digest);
@@ -555,7 +574,13 @@ impl RuntimeInner {
         .map_err(|error| Error::Preparation(format!("compiler task failed: {error}")))??;
         let (prepared, aot_bytes) = prepared;
         if let Some(disk) = &self.disk {
-            disk.publish(digest, prepared.profile, &aot_bytes)?;
+            // The disk cache is an optional acceleration layer. Once trusted
+            // source has compiled successfully, a quota, permission, or I/O
+            // failure must not discard the usable in-memory result. Existing
+            // entries still fail closed on load before this path is reached.
+            if disk.publish(digest, prepared.profile, &aot_bytes).is_err() {
+                self.disk_publish_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let aot = Arc::new(PreparedAot {
             bytes: aot_bytes,
@@ -609,7 +634,7 @@ impl RuntimeInner {
             HostState {
                 wasi: wasi.build(),
                 http: wasmtime_wasi_http::WasiHttpCtx::new(),
-                http_hooks: DenyHttpHooks,
+                http_hooks: crate::http::HttpHooks::deny(),
                 table: ResourceTable::new(),
                 limits,
             },
@@ -659,7 +684,7 @@ impl RuntimeInner {
                 let command = wasmtime_wasi::p3::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
-                    &self.p3_linker,
+                    self.p3_linker()?,
                 )
                 .await
                 .map_err(|error| Error::Execution(error.to_string()))?;
@@ -686,7 +711,7 @@ impl RuntimeInner {
                 let command = wasmtime_wasi::p2::bindings::Command::instantiate_async(
                     &mut store,
                     &prepared.component,
-                    &self.p2_linker,
+                    self.p2_linker()?,
                 )
                 .await
                 .map_err(|error| Error::Execution(error.to_string()))?;
@@ -738,71 +763,9 @@ impl Drop for RuntimeInner {
 pub(crate) struct HostState {
     pub(crate) wasi: WasiCtx,
     pub(crate) http: wasmtime_wasi_http::WasiHttpCtx,
-    pub(crate) http_hooks: DenyHttpHooks,
+    pub(crate) http_hooks: crate::http::HttpHooks,
     pub(crate) table: ResourceTable,
     pub(crate) limits: StoreLimits,
-}
-
-pub(crate) struct DenyHttpHooks;
-
-impl wasmtime_wasi_http::p2::WasiHttpHooks for DenyHttpHooks {
-    fn send_request(
-        &mut self,
-        _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
-    {
-        Err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied.into())
-    }
-}
-
-impl wasmtime_wasi_http::p3::WasiHttpHooks for DenyHttpHooks {
-    fn send_request(
-        &mut self,
-        _request: http::Request<
-            http_body_util::combinators::UnsyncBoxBody<
-                Bytes,
-                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-            >,
-        >,
-        _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
-        _fut: Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        (),
-                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                    >,
-                > + Send,
-        >,
-    ) -> Box<
-        dyn Future<
-                Output = std::result::Result<
-                    (
-                        http::Response<
-                            http_body_util::combinators::UnsyncBoxBody<
-                                Bytes,
-                                wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                            >,
-                        >,
-                        Box<
-                            dyn Future<
-                                    Output = std::result::Result<
-                                        (),
-                                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                                    >,
-                                > + Send,
-                        >,
-                    ),
-                    wasmtime_wasi::TrappableError<
-                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode,
-                    >,
-                >,
-            > + Send,
-    > {
-        Box::new(async {
-            Err(wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::HttpRequestDenied.into())
-        })
-    }
 }
 
 impl WasiView for HostState {
@@ -992,6 +955,28 @@ fn detect_profile(engine: &Engine, component: &Component) -> Result<WasiProfile>
             "component exports more than one supported WASI world".to_owned(),
         )),
     }
+}
+
+fn build_p3_linker(engine: &Engine) -> Result<Linker<HostState>> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p3::add_to_linker(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    // Preview 3 components produced through the current preview 1 adapter may
+    // still import preview 2 CLI interfaces alongside their p3 export.
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    Ok(linker)
+}
+
+fn build_p2_linker(engine: &Engine) -> Result<Linker<HostState>> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    Ok(linker)
 }
 
 fn engine_config() -> Config {

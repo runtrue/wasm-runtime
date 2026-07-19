@@ -1,0 +1,13 @@
+[package]
+name = "p2-http-hello"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip2 = "=1.0.4"
+
+[workspace]
