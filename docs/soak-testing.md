@@ -1,10 +1,10 @@
 # Service soak testing
 
-The tagged release candidate must run as a real TCP service before public
-release. The soak harness starts the standalone streaming HTTP example, creates
-fresh TCP connections at bounded concurrency, records errors and latency
-histogram bounds, and samples Linux RSS without retaining every request
-measurement.
+The tagged release candidate must run as a real TCP service before the stable
+release. The soak harness starts the standalone streaming HTTP example,
+creates fresh TCP connections at bounded concurrency, records errors and
+latency histogram bounds, and samples Linux RSS without retaining every
+request measurement.
 
 Run a short validation locally:
 

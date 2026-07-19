@@ -1,8 +1,9 @@
 # 0.1 release gates
 
-The repository remains private until the `0.1` evidence is complete. Workflow
-files are automation, not proof by themselves: every claim needs a retained
-test, benchmark, report, or operator record from the release candidate.
+These gates define the evidence required before the stable `0.1.0` release.
+Workflow files are automation, not proof by themselves: every claim needs a
+retained test, benchmark, report, or operator record from the release
+candidate.
 
 The current release target is **Linux x86_64**. macOS, ARM64, and other targets
 are expansion work, not implied support and not blockers for this target.
@@ -21,7 +22,7 @@ are expansion work, not implied support and not blockers for this target.
 | HTTP capabilities | A real JSON tool reaches only an exact method-bound, body-limited outbound grant; default deny and private-network policy are tested |
 | Performance | Cold, disk AOT, warmish, warm, TCP, throughput, and RSS evidence follows the benchmark methodology and compares identical components with raw Wasmtime |
 | Packaging | API docs, examples, license and advisory checks, SBOM, provenance where available, checksums, signed tags, and a clean packaged consumer pass |
-| Operations | Cache recovery, production isolation, and the seven-day private service soak have operator evidence |
+| Operations | Cache recovery, production isolation, and the seven-day service soak have operator evidence |
 
 ## Local evidence commands
 
