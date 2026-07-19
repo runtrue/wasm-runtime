@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Prerelease versions are marked as prereleases automatically when the
+  tag-driven GitHub release is published.
+
 ## [0.1.0-alpha.5] - 2026-07-19
 
 ### Changed
