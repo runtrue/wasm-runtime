@@ -26,7 +26,13 @@ def run(*arguments: str, env: dict[str, str] | None = None) -> None:
 def main() -> None:
     if not ADAPTER.is_file():
         raise SystemExit("run `uv run benchmarks/bootstrap_tools.py` first")
-    remap = f"--remap-path-prefix={ROOT}=."
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")).resolve()
+    remap = " ".join(
+        (
+            f"--remap-path-prefix={ROOT}=.",
+            f"--remap-path-prefix={cargo_home}=/.cargo",
+        )
+    )
     reproducible_env = os.environ | {
         "CARGO_INCREMENTAL": "0",
         "RUSTFLAGS": remap,
@@ -39,7 +45,7 @@ def main() -> None:
         "--edition=2024",
         "--crate-name",
         "oversized_output",
-        remap,
+        f"--remap-path-prefix={ROOT}=.",
         "--target",
         "wasm32-wasip2",
         "-C",
