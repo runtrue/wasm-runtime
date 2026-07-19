@@ -47,4 +47,3 @@ uv run benchmarks/http_soak.py --duration-seconds 60 --concurrency 8 > soak.json
 Run the TCP comparison three times with rotated `--runner-order` values as
 defined in [benchmark methodology](benchmark-methodology.md). A single shared
 runner result is not release-grade sub-millisecond evidence.
-
