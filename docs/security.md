@@ -16,15 +16,14 @@ redirect policy, and ambient proxy configuration are not capabilities.
 
 Private, loopback, link-local, multicast, unspecified, and other non-public IP
 destinations are rejected after DNS resolution unless the exact grant opts in
-with `allow_private_network(true)`. This opt-in is intended for a trusted local
-service and should not be exposed directly to an untrusted tenant.
+with `allow_private_network(true)`. Use this opt-in only for a trusted local
+service; do not expose it directly to an untrusted tenant.
 
 The 0.1 connector performs DNS validation before the default Wasmtime HTTP
 connector resolves and connects. It does not pin the validated address to the
 connection, so a malicious or compromised DNS service may exploit a rebinding
 window. Use exact HTTPS origins, trusted DNS, and network-level egress controls
-for defense in depth. A future connector can remove this limitation by
-connecting only to the validated address while retaining TLS hostname checks.
+for defense in depth.
 
 ## AOT artifacts
 
@@ -54,4 +53,6 @@ metadata, or authentication key makes an entry incompatible.
 
 This model does not yet claim multi-tenant process isolation. Run mutually
 hostile tenants in separate OS sandboxes and add host network policy around the
-process.
+process. See the [production isolation boundary](production-isolation.md) for
+host requirements and [AOT cache operations](cache-operations.md) for key
+rotation and recovery procedures.

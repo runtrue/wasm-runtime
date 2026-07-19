@@ -1,17 +1,26 @@
 # Public API stability
 
-The Rust crate is the primary implementation and owns the stable surface used
-by future Python bindings. Standard WASI worlds are guest contracts; RunTrue
-policy must remain host configuration rather than a custom guest ABI.
+## Scope
 
-For the 0.1 series, the intended core surface is `RuntimeBuilder`, `Runtime`,
+The Rust crate owns the runtime implementation and its stable public surface.
+Standard WASI worlds define component contracts; runtime policy is expressed
+through host configuration.
+
+The 0.1 core surface is `RuntimeBuilder`, `Runtime`,
 `Program`, `CommandInput`, `CommandOutput`, `HttpService`, `HttpRequest`,
-`HttpResponse`, `OutboundHttpGrant`, tier measurements, cancellation, and
-pause/resume controls. Public APIs do not expose Wasmtime engines, stores,
-linkers, component handles, or generated WASI bindings.
+`HttpResponse`, `StreamingHttpBody`, `HttpDispatchMetadata`,
+`OutboundHttpGrant`, tier measurements, cancellation, and pause/resume
+controls. The streaming HTTP surface uses the standard `http`/`http-body`
+model without exposing Wasmtime engines, stores, linkers, component handles,
+generated WASI bindings, or Wasmtime error types. Its dispatch metadata is
+stored inline with the response body so control-plane correlation does not
+require a per-request extension allocation.
+
 Public state and error enums plus runtime-produced output structures are
 non-exhaustive so standards versions, measurements, and observable states can
 be added without forcing an immediate breaking release.
+
+## Compatibility during 0.1
 
 WASI 0.3 integration, resident HTTP reuse, and cooperative pause semantics are
 experimental during 0.1. Patch releases may correct behavior that violates the
@@ -21,13 +30,10 @@ changelog entry and migration guidance.
 
 Configuration structures currently expose fields to keep early embedding
 simple. Consumers should construct them with `Default` and struct update syntax
-instead of assuming the complete field set. Before 1.0, migrate long-lived
-configuration surfaces to builders so fields can be added compatibly.
+instead of assuming the complete field set. Configuration fields are not a
+stable extension point during the 0.1 series.
 
-After the first public crate release, run `cargo-semver-checks` against the last
-published version in release pull requests. It is intentionally not a useful
-gate before a registry baseline exists.
+## Release checks
 
-Python bindings should wrap this crate rather than duplicate runtime policy.
-Start them only after the 0.1 Rust surface has completed at least one private
-consumer cycle.
+`cargo-semver-checks` requires a published registry baseline, so it is not a
+release gate until one exists.

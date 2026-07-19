@@ -28,8 +28,8 @@ checksums and the SBOM are still included in the release bundle.
 
 ## Cutting a release
 
-1. Make the release-gate evidence current and resolve every blocking item in
-   `docs/release-gates.md`.
+1. Make the [release-gate evidence](release-gates.md) current and resolve every
+   blocking item.
 2. Update the version in `Cargo.toml` and `Cargo.lock`.
 3. Move the changelog entries from `Unreleased` into a dated version heading.
 4. Run `scripts/release-check.sh` and merge the release pull request.
@@ -41,9 +41,9 @@ checksums and the SBOM are still included in the release bundle.
    ```
 
 6. Run the `Release` workflow with that tag. Leave `publish_crate` disabled for
-   a private GitHub-only release. To enable it, also enter `publish <tag>` in
-   the confirmation field after approving public source publication to
-   crates.io.
+   a private GitHub-only release. To enable it, enter `publish <tag>` in the
+   confirmation field only after approving permanent public source publication
+   to crates.io.
 7. Download the release assets, verify `SHA256SUMS`, and smoke-test the crate
    in a new empty consumer project before announcing it.
 
