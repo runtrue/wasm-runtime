@@ -126,6 +126,7 @@ async fn wait_until_paused(running: &RunningCommand) -> Result<(), Error> {
                 return Err(Error::InvalidState("invocation finished before pausing"));
             }
             InvocationState::Running | InvocationState::PauseRequested => {}
+            _ => return Err(Error::InvalidState("unknown invocation state")),
         }
         if Instant::now() >= deadline {
             return Err(Error::InvalidState("pause acknowledgement timed out"));

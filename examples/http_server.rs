@@ -1,12 +1,8 @@
 //! Minimal HTTP/1 host for a standard WASI HTTP component.
 
-use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
-use hyper::{
-    Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
-};
-use runtrue_wasm_runtime::{HttpRequest, HttpService, HttpServiceConfig, Runtime};
-use std::{convert::Infallible, sync::Arc, time::Instant};
+use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+use runtrue_wasm_runtime::{Error, HttpService, HttpServiceConfig, Runtime, StreamingHttpBody};
+use std::{sync::Arc, time::Instant};
 use tokio::net::TcpListener;
 use wasmtime_wasi_http::io::TokioIo;
 
@@ -57,48 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle(
     service: Arc<HttpService>,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (parts, body) = request.into_parts();
-    let body = match http_body_util::Limited::new(body, 1024 * 1024)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(_) => {
-            return Ok(response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request body too large",
-            ));
-        }
-    };
-    let mut guest = HttpRequest::new(parts.method.as_str(), parts.uri.to_string(), body.to_vec());
-    guest.headers = parts
-        .headers
-        .iter()
-        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-        .collect();
-    match service.handle(guest).await {
-        Ok(output) => {
-            let mut builder = Response::builder().status(output.status);
-            for (name, value) in output.headers {
-                builder = builder.header(name, value);
-            }
-            Ok(builder
-                .body(Full::new(Bytes::from(output.body)))
-                .unwrap_or_else(|_| {
-                    response(StatusCode::INTERNAL_SERVER_ERROR, "invalid response")
-                }))
-        }
-        Err(error) => Ok(response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("guest failed: {error}"),
-        )),
-    }
-}
-
-fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
-        .expect("static response is valid")
+) -> Result<Response<StreamingHttpBody>, Error> {
+    service.handle_streaming(request).await
 }

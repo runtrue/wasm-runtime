@@ -17,10 +17,11 @@ pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use config::{RuntimeConfig, RuntimeLimits};
 pub use error::{Error, Result};
 pub use http::{
-    HttpRequest, HttpResponse, HttpService, HttpServiceConfig, HttpServiceMetrics, HttpServiceState,
+    HttpDispatchMetadata, HttpRequest, HttpResponse, HttpService, HttpServiceConfig,
+    HttpServiceMetrics, HttpServiceState, OutboundHttpGrant, StreamingHttpBody,
 };
 pub use measurement::{PhaseTimings, RunMeasurement};
-pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder};
+pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder, RuntimeMetrics};
 pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
     WasiProfile, WasiVersion,

@@ -1,0 +1,36 @@
+[package]
+name = "runtrue-wasm-runtime-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+runtrue-wasm-runtime = { path = "..", version = "=0.1.0-alpha.4" }
+tempfile = "=3.23.0"
+tokio = { version = "=1.51.1", features = ["rt", "time"] }
+
+[[bin]]
+name = "component_admission"
+path = "fuzz_targets/component_admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_capabilities"
+path = "fuzz_targets/http_capabilities.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "disk_aot_corruption"
+path = "fuzz_targets/disk_aot_corruption.rs"
+test = false
+doc = false
+bench = false
