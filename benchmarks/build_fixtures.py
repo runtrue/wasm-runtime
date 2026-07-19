@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -18,13 +19,19 @@ FIXTURES = {
 }
 
 
-def run(*arguments: str) -> None:
-    subprocess.run(arguments, cwd=ROOT, check=True)
+def run(*arguments: str, env: dict[str, str] | None = None) -> None:
+    subprocess.run(arguments, cwd=ROOT, check=True, env=env)
 
 
 def main() -> None:
     if not ADAPTER.is_file():
         raise SystemExit("run `uv run benchmarks/bootstrap_tools.py` first")
+    remap = f"--remap-path-prefix={ROOT}=."
+    reproducible_env = os.environ | {
+        "CARGO_INCREMENTAL": "0",
+        "RUSTFLAGS": remap,
+        "SOURCE_DATE_EPOCH": "0",
+    }
     oversized_source = ROOT / "tests/fixtures/oversized_output.rs"
     oversized_output = ROOT / "tests/fixtures/oversized-output.component.wasm"
     run(
@@ -32,6 +39,7 @@ def main() -> None:
         "--edition=2024",
         "--crate-name",
         "oversized_output",
+        remap,
         "--target",
         "wasm32-wasip2",
         "-C",
@@ -55,17 +63,20 @@ def main() -> None:
         run(
             "cargo",
             "build",
+            "--locked",
             "--manifest-path",
             str(manifest),
             "--target",
             "wasm32-wasip1",
             "--release",
+            env=reproducible_env,
         )
         module = manifest.parent / f"target/wasm32-wasip1/release/{artifact}"
         output = ROOT / f"tests/fixtures/{package}.component.wasm"
         run(
             "cargo",
             "run",
+            "--locked",
             "--quiet",
             "--example",
             "componentize",
