@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # ///
-"""Build standard WASI HTTP fixtures with the pinned official proxy adapter."""
+"""Build reproducible WASI and WASIX fixtures with pinned tools."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / ".benchmark-tools/wasi_snapshot_preview1.proxy.wasm"
+WASM_OPT = ROOT / ".benchmark-tools/wasm-opt"
 FIXTURES = {
     "p2-http-hello": "p2_http_hello.wasm",
     "json-http-tool": "json_http_tool.wasm",
@@ -24,7 +25,7 @@ def run(*arguments: str, env: dict[str, str] | None = None) -> None:
 
 
 def main() -> None:
-    if not ADAPTER.is_file():
+    if not ADAPTER.is_file() or not WASM_OPT.is_file():
         raise SystemExit("run `uv run benchmarks/bootstrap_tools.py` first")
     cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")).resolve()
     remap = " ".join(
@@ -63,6 +64,55 @@ def main() -> None:
     print(
         f"{oversized_output.relative_to(ROOT)} "
         f"sha256={hashlib.sha256(oversized_output.read_bytes()).hexdigest()}"
+    )
+    checkpoint_source = ROOT / "tests/fixtures/wasix_checkpoint_number.rs"
+    checkpoint_raw = ROOT / "target/wasix-checkpoint-number.raw.wasm"
+    checkpoint_output = ROOT / "tests/fixtures/wasix-checkpoint-number.wasm"
+    checkpoint_raw.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        "rustc",
+        "--edition=2024",
+        "--crate-name",
+        "wasix_checkpoint_number",
+        f"--remap-path-prefix={ROOT}=.",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-C",
+        "opt-level=z",
+        "-C",
+        "lto=fat",
+        "-C",
+        "panic=abort",
+        "-C",
+        "strip=debuginfo",
+        "-C",
+        "link-arg=--no-entry",
+        "-C",
+        "link-arg=--export=_start",
+        "-C",
+        "link-arg=--export-memory",
+        "-C",
+        "link-arg=--export=__stack_pointer",
+        "-C",
+        "link-arg=--export=__data_end",
+        str(checkpoint_source),
+        "-o",
+        str(checkpoint_raw),
+    )
+    run(
+        str(WASM_OPT),
+        str(checkpoint_raw),
+        "--asyncify",
+        "--pass-arg=asyncify-imports@wasix_32v1.proc_snapshot",
+        "-Oz",
+        "--strip-debug",
+        "--strip-producers",
+        "-o",
+        str(checkpoint_output),
+    )
+    print(
+        f"{checkpoint_output.relative_to(ROOT)} "
+        f"sha256={hashlib.sha256(checkpoint_output.read_bytes()).hexdigest()}"
     )
     for package, artifact in FIXTURES.items():
         manifest = ROOT / f"benchmarks/fixtures/{package}/Cargo.toml"

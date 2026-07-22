@@ -17,6 +17,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DESTINATION = ROOT / ".benchmark-tools"
 ASSETS = {
+    "wasm-opt": (
+        "https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-x86_64-linux.tar.gz",
+        "b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db",
+        "binaryen-version_131/bin/wasm-opt",
+    ),
     "wasmtime": (
         "https://github.com/bytecodealliance/wasmtime/releases/download/v46.0.1/wasmtime-v46.0.1-x86_64-linux.tar.xz",
         "9ae0b17ea298bcc52277a8208d6ab7fae8e1a89579672f9d82f9d86c116edb62",

@@ -54,6 +54,12 @@ tempfile = "=3.23.0"
 wat = "=1.251.0"
 wit-component = "=0.244.0"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# WASIX 0.701's journal feature does not compile with sys-minimal, so keep the
+# broad journal-capable runtime confined to the Linux-only qualification test.
+wasmer = { version = "=7.1.0", default-features = false, features = ["cranelift"] }
+wasmer-wasix = { version = "=0.701.0", default-features = false, features = ["sys"] }
+
 [[bin]]
 name = "runtrue-wasix-worker"
 path = "src/bin/runtrue-wasix-worker.rs"
