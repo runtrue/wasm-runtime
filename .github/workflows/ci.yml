@@ -48,19 +48,28 @@ jobs:
       - name: Check all targets
         run: cargo check --locked --all-targets
 
+      - name: Check all feature targets
+        run: cargo check --locked --all-targets --all-features
+
       - name: Lint all targets
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Lint all feature targets
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test all targets
         run: cargo test --locked --all-targets
 
-      - name: Test documentation
-        run: cargo test --locked --doc
+      - name: Test all feature targets
+        run: cargo test --locked --all-targets --all-features
 
-      - name: Build documentation without warnings
+      - name: Test all feature documentation
+        run: cargo test --locked --doc --all-features
+
+      - name: Build all feature documentation without warnings
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps
+        run: cargo doc --locked --no-deps --all-features
 
       - name: Verify the crates.io source package
         run: cargo package --locked

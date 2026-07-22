@@ -43,10 +43,13 @@ fi
 
 cargo fmt --all -- --check
 cargo check --locked --all-targets
+cargo check --locked --all-targets --all-features
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
-cargo test --locked --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 cargo package --locked
 
 package_files="$(cargo package --locked --list)"

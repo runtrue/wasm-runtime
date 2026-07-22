@@ -27,6 +27,14 @@ mkdir "$workspace/package"
 tar -xzf "$archive" -C "$workspace/package"
 packaged_crate="$workspace/package/runtrue-wasm-runtime-$version"
 
+# Verify optional feature code from the exact extracted source archive rather
+# than relying only on the repository checkout used to build the archive.
+CARGO_TARGET_DIR="$package_target" cargo check \
+    --manifest-path "$packaged_crate/Cargo.toml" \
+    --locked \
+    --all-targets \
+    --all-features
+
 cargo init --quiet --bin --name packaged-runtime-consumer "$workspace/consumer"
 install -m 0644 scripts/package-consumer/main.rs "$workspace/consumer/src/main.rs"
 install -m 0644 \

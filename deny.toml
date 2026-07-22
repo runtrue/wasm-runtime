@@ -8,15 +8,24 @@ unmaintained = "workspace"
 [licenses]
 confidence-threshold = 0.93
 allow = [
+    "0BSD",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
+
+[[licenses.clarify]]
+crate = "saffron@0.1.0"
+expression = "BSD-3-Clause"
+license-files = [{ path = "LICENSE", hash = 0xfbcc64e4 }]
 
 [bans]
 multiple-versions = "allow"
