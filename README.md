@@ -47,6 +47,13 @@ arguments and environment, stops at an explicit WASIX snapshot, and returns a
 trusted journal for `WasixCheckpointCodec::seal`. Standard input is not yet
 supported by the capture path.
 
+To move the checkpoint, authenticate the captured journal with
+`WasixCheckpointCodec`, transfer the sealed artifact and exact module to the
+destination, reopen the artifact, and pass it to `restore_wasix_checkpoint`.
+The integration suite proves this flow with a Rust/WASIX program that captures
+the argument `424242` in one worker and prints it after resuming in a different
+worker without destination arguments.
+
 ## Execution tiers
 
 | Tier | Retained material | Work before execution |
