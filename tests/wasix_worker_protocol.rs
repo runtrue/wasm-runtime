@@ -24,7 +24,7 @@ async fn validates_the_explicit_worker_build_and_fresh_process() {
     assert_eq!(metadata.cohort_id, WASIX_COHORT_ID);
     assert_ne!(metadata.process_id, std::process::id());
     let isolation = metadata.isolation;
-    assert_eq!(isolation.profile_version, 1);
+    assert_eq!(isolation.profile_version, 2);
     assert!(!isolation.user_ids.contains(&0));
     assert!(!isolation.group_ids.contains(&0));
     assert!(!isolation.has_root_supplementary_group);
@@ -32,6 +32,7 @@ async fn validates_the_explicit_worker_build_and_fresh_process() {
     assert!(!isolation.dumpable);
     assert_eq!(isolation.capability_masks, [0; 4]);
     assert_eq!(isolation.core_file_limits, [0; 2]);
+    assert_eq!(isolation.file_size_limits, [512 * 1024 * 1024; 2]);
     assert_eq!(isolation.open_file_limits[0], isolation.open_file_limits[1]);
     assert!((1..=64).contains(&isolation.open_file_limits[0]));
     assert_eq!(isolation.supplementary_group_ids, expected_groups);
