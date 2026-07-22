@@ -6,6 +6,7 @@ use crate::{
 use bytes::Bytes;
 use std::{
     collections::HashMap,
+    future::Future,
     path::Path,
     sync::{
         Arc, Mutex, OnceLock,
@@ -210,6 +211,32 @@ impl Program {
         Ok(PackageTier::Warm)
     }
 
+    /// Validate and prepare the component, returning its detected standard
+    /// WASI profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cache authentication, compilation,
+    /// deserialization, or standard-profile validation fails.
+    pub async fn profile(&self) -> Result<WasiProfile> {
+        self.runtime
+            .inner
+            .prepare(&self.digest, Arc::clone(&self.bytes))
+            .await
+            .map(|prepared| prepared.profile)
+    }
+
+    /// Blocking form of [`Program::profile`] for synchronous embedders.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Program::profile`], plus runtime-thread
+    /// initialization or panic failures.
+    pub fn profile_blocking(&self) -> Result<WasiProfile> {
+        let program = self.clone();
+        block_on_owned(async move { program.profile().await })
+    }
+
     /// Invoke the standard command with a fresh Store, instance, WASI context,
     /// input streams, output streams, limits, fuel, timeout, and cancellation.
     ///
@@ -219,6 +246,17 @@ impl Program {
     /// instantiation, a guest trap, timeout, or cancellation.
     pub async fn run(&self, input: CommandInput) -> Result<CommandOutput> {
         self.run_controlled(input, PauseToken::new()).await
+    }
+
+    /// Blocking form of [`Program::run`] for synchronous embedders.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Program::run`], plus runtime-thread
+    /// initialization or panic failures.
+    pub fn run_blocking(&self, input: CommandInput) -> Result<CommandOutput> {
+        let program = self.clone();
+        block_on_owned(async move { program.run(input).await })
     }
 
     /// Spawn an independently controllable invocation on the current Tokio
@@ -910,6 +948,22 @@ fn least_recent<T>(entries: &HashMap<String, CacheEntry<T>>) -> Option<String> {
         .iter()
         .min_by_key(|(key, entry)| (entry.last_used, *key))
         .map(|(key, _)| key.clone())
+}
+
+fn block_on_owned<T, F>(future: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| Error::Configuration(error.to_string()))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| Error::Execution("runtime thread panicked".to_owned()))?
 }
 
 #[allow(unsafe_code)]

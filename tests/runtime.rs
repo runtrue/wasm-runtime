@@ -2,7 +2,7 @@
 
 use runtrue_wasm_runtime::{
     AotAuthenticationKey, CommandInput, DiskCacheConfig, Error, InvocationState, PackageTier,
-    RunningCommand, Runtime, RuntimeConfig, WasiVersion,
+    RunningCommand, Runtime, RuntimeConfig, WasiProfile, WasiVersion,
 };
 use std::time::Duration;
 use tempfile::TempDir;
@@ -90,6 +90,16 @@ fn wasi_0_3_command_is_the_primary_accepted_profile() {
         .unwrap();
     assert_eq!(output.wasi_version, WasiVersion::V0_3);
     assert_eq!(output.exit_code, 0);
+}
+
+#[test]
+fn synchronous_embedders_can_discover_and_run_a_standard_profile() {
+    let runtime = Runtime::with_defaults().unwrap();
+    let program = runtime.load_bytes(p3_command()).unwrap();
+    assert_eq!(program.profile_blocking().unwrap(), WasiProfile::Cli0_3);
+    let output = program.run_blocking(CommandInput::default()).unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.wasi_version, WasiVersion::V0_3);
 }
 
 #[test]
