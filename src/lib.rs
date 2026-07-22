@@ -14,6 +14,8 @@ mod http;
 mod measurement;
 mod runtime;
 mod types;
+#[cfg(feature = "wasix-checkpoint")]
+mod wasix_output;
 mod wasix_worker;
 
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
@@ -37,11 +39,16 @@ pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
     WasiProfile, WasiVersion,
 };
+#[cfg(feature = "wasix-checkpoint")]
+#[doc(hidden)]
+pub use wasix_worker::write_wasix_checkpoint_restore;
 pub use wasix_worker::{
     WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixCheckpointTransportMetadata,
     WasixWorkerConfig, WasixWorkerIsolation, WasixWorkerMetadata, probe_wasix_checkpoint_transport,
     probe_wasix_worker,
 };
+#[cfg(feature = "wasix-checkpoint")]
+pub use wasix_worker::{WasixCheckpointRestoreMetadata, restore_wasix_checkpoint};
 #[cfg(feature = "wasix")]
 #[doc(hidden)]
 pub use wasix_worker::{write_wasix_checkpoint_transport_probe, write_wasix_worker_probe};

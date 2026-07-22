@@ -37,6 +37,11 @@ The checkpoint feature does not relax the worker trust boundary: guest input
 is still withheld until the fresh worker reports the required compatibility
 and Linux isolation state.
 
+`restore_wasix_checkpoint` accepts an authenticated checkpoint and its exact
+module, starts a fresh isolated destination worker, and resumes without any
+destination arguments. Restored arguments and process state come only from the
+checkpoint journal.
+
 ## Execution tiers
 
 | Tier | Retained material | Work before execution |
