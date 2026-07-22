@@ -1,6 +1,6 @@
 //! End-to-end qualification of WASIX explicit snapshot and resume semantics.
 
-#![cfg(all(feature = "wasix", target_os = "linux"))]
+#![cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
 
 use std::{io::Read, sync::Arc};
 
@@ -37,9 +37,8 @@ fn run_fixture(
     writable_journal: Option<Arc<LogFileJournal>>,
     stop_after_explicit_snapshot: bool,
 ) {
-    // WASIX 0.701's native journal code does not compile with sys-minimal, so
-    // this qualification-only dev dependency uses its sys preset. Neutralize
-    // the preset's host clients, then avoid WasiRunner because it registers
+    // The checkpoint feature uses WASIX's journal-capable sys preset.
+    // Neutralize its host clients, then avoid WasiRunner because it registers
     // each journal twice and loses the valid rewind state on the EOF replay.
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

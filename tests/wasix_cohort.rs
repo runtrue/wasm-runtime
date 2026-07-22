@@ -27,3 +27,14 @@ fn wasmtime_and_wasix_cohort_initialize_together() {
     assert!(std::any::type_name::<wasmer_wasix::PluggableRuntime>().contains("PluggableRuntime"));
     assert!(std::any::type_name::<webc::Container>().contains("Container"));
 }
+
+#[cfg(feature = "wasix-checkpoint")]
+#[test]
+fn checkpoint_feature_links_the_native_journal_cohort() {
+    assert!(
+        std::any::type_name::<wasmer_wasix::journal::LogFileJournal>().contains("LogFileJournal")
+    );
+    assert!(
+        std::any::type_name::<wasmer_wasix::journal::SnapshotTrigger>().contains("SnapshotTrigger")
+    );
+}
