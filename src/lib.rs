@@ -7,6 +7,7 @@
 
 mod cache;
 mod config;
+mod environment;
 mod error;
 mod http;
 mod measurement;
@@ -15,6 +16,10 @@ mod types;
 
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use config::{RuntimeConfig, RuntimeLimits};
+pub use environment::{
+    EnvironmentArtifact, EnvironmentBuild, EnvironmentCommands, EnvironmentFilesystem,
+    EnvironmentLanguage, EnvironmentManifest,
+};
 pub use error::{Error, Result};
 pub use http::{
     HttpDispatchMetadata, HttpRequest, HttpResponse, HttpService, HttpServiceConfig,
