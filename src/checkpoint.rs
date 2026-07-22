@@ -160,6 +160,20 @@ impl std::fmt::Debug for CapturedWasixJournal {
 }
 
 impl CapturedWasixJournal {
+    #[cfg(any(feature = "wasix-checkpoint", test))]
+    pub(crate) fn from_attested_worker_capture(
+        bytes: Vec<u8>,
+        module_sha256: String,
+    ) -> Result<Self> {
+        validate_sha256("captured journal module digest", &module_sha256)?;
+        scan_journal(&bytes)?;
+        Ok(Self {
+            bytes,
+            module_sha256,
+            explicit_snapshot: true,
+        })
+    }
+
     /// Size of the captured journal prefix.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -903,6 +917,46 @@ mod tests {
         push_record(&mut journal, 60, &[]);
         push_record(&mut journal, JOURNAL_SNAPSHOT_V1, &[0]);
         journal
+    }
+
+    #[test]
+    fn constructs_only_a_canonical_attested_worker_capture() {
+        let bytes = valid_journal();
+        let module_sha256 = binding().module_sha256;
+        let captured = CapturedWasixJournal::from_attested_worker_capture(
+            bytes.clone(),
+            module_sha256.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(captured.bytes, bytes);
+        assert_eq!(captured.module_sha256, module_sha256);
+        assert!(captured.explicit_snapshot);
+    }
+
+    #[test]
+    fn rejects_malformed_or_noncanonical_attested_worker_capture() {
+        let module_sha256 = binding().module_sha256;
+        let mut malformed = valid_journal();
+        push_record(&mut malformed, 60, &[]);
+        assert!(matches!(
+            CapturedWasixJournal::from_attested_worker_capture(
+                malformed,
+                module_sha256.clone(),
+            ),
+            Err(Error::Checkpoint(message))
+                if message == "checkpoint journal contains records after its snapshot"
+        ));
+
+        assert!(matches!(
+            CapturedWasixJournal::from_attested_worker_capture(
+                valid_journal(),
+                format!("A{}", &module_sha256[1..]),
+            ),
+            Err(Error::Checkpoint(message))
+                if message
+                    == "captured journal module digest must be 64 lowercase hexadecimal characters"
+        ));
     }
 
     fn captured(bytes: Vec<u8>) -> CapturedWasixJournal {

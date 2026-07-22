@@ -33,6 +33,7 @@ async fn validates_the_explicit_worker_build_and_fresh_process() {
     assert_eq!(isolation.capability_masks, [0; 4]);
     assert_eq!(isolation.core_file_limits, [0; 2]);
     assert_eq!(isolation.file_size_limits, [512 * 1024 * 1024; 2]);
+    assert_eq!(isolation.address_space_limits, [2 * 1024 * 1024 * 1024; 2]);
     assert_eq!(isolation.open_file_limits[0], isolation.open_file_limits[1]);
     assert!((1..=64).contains(&isolation.open_file_limits[0]));
     assert_eq!(isolation.supplementary_group_ids, expected_groups);

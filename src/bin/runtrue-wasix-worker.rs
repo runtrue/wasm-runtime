@@ -6,7 +6,7 @@ fn main() {
     let operation = arguments.next();
     if arguments.next().is_some() {
         eprintln!(
-            "usage: runtrue-wasix-worker (--protocol-probe|--checkpoint-transport-probe|--checkpoint-restore)"
+            "usage: runtrue-wasix-worker (--protocol-probe|--checkpoint-transport-probe|--checkpoint-restore|--checkpoint-capture)"
         );
         std::process::exit(64);
     }
@@ -27,9 +27,16 @@ fn main() {
                 std::io::stdout().lock(),
             )
         }
+        #[cfg(feature = "wasix-checkpoint")]
+        Some(value) if value == std::ffi::OsStr::new("--checkpoint-capture") => {
+            runtrue_wasm_runtime::write_wasix_checkpoint_capture(
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )
+        }
         _ => {
             eprintln!(
-                "usage: runtrue-wasix-worker (--protocol-probe|--checkpoint-transport-probe|--checkpoint-restore)"
+                "usage: runtrue-wasix-worker (--protocol-probe|--checkpoint-transport-probe|--checkpoint-restore|--checkpoint-capture)"
             );
             std::process::exit(64);
         }

@@ -42,6 +42,11 @@ module, starts a fresh isolated destination worker, and resumes without any
 destination arguments. Restored arguments and process state come only from the
 checkpoint journal.
 
+`capture_wasix_checkpoint` starts a fresh isolated source worker with bounded
+arguments and environment, stops at an explicit WASIX snapshot, and returns a
+trusted journal for `WasixCheckpointCodec::seal`. Standard input is not yet
+supported by the capture path.
+
 ## Execution tiers
 
 | Tier | Retained material | Work before execution |
