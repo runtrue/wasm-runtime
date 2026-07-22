@@ -44,8 +44,10 @@ fi
 cargo fmt --all -- --check
 cargo check --locked --all-targets
 cargo check --locked --all-targets --all-features
+cargo check --locked --no-default-features --features wasix --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --no-default-features --features wasix --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo test --locked --all-targets --all-features
 cargo test --locked --doc --all-features

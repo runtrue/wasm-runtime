@@ -25,6 +25,18 @@ world:
 Native binaries, core Wasm modules, and components outside these worlds are
 rejected.
 
+## Optional WASIX features
+
+- `wasix` enables the isolated worker protocol with WASIX's minimal native
+  system surface.
+- `wasix-checkpoint` additionally enables the pinned native journal cohort
+  required for checkpoint capture and replay. It is opt-in because the WASIX
+  0.701 journal is part of its broader `sys` preset.
+
+The checkpoint feature does not relax the worker trust boundary: guest input
+is still withheld until the fresh worker reports the required compatibility
+and Linux isolation state.
+
 ## Execution tiers
 
 | Tier | Retained material | Work before execution |

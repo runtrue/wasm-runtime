@@ -51,11 +51,17 @@ jobs:
       - name: Check all feature targets
         run: cargo check --locked --all-targets --all-features
 
+      - name: Check minimal WASIX targets
+        run: cargo check --locked --no-default-features --features wasix --all-targets
+
       - name: Lint all targets
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Lint all feature targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Lint minimal WASIX targets
+        run: cargo clippy --locked --no-default-features --features wasix --all-targets -- -D warnings
 
       - name: Test all targets
         run: cargo test --locked --all-targets
