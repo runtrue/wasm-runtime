@@ -2,7 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use runtrue_wasm_runtime::{
-    HttpRequest, HttpServiceConfig, OutboundHttpGrant, Program, Runtime as WasmRuntime,
+    HttpRequest, HttpServiceConfig, HttpServiceState, OutboundHttpGrant, Program,
+    Runtime as WasmRuntime,
 };
 use std::{sync::OnceLock, time::Duration};
 use tokio::runtime::{Builder, Runtime as TokioRuntime};
@@ -93,6 +94,7 @@ fuzz_target!(|input: &[u8]| {
         request_timeout: Duration::from_millis(u64::from(cursor.byte())),
         outbound_grants,
     };
+    let reuse_limit = config.max_instance_reuse_count;
     let request = HttpRequest::new(
         cursor.text(32),
         cursor.text(128),
@@ -106,6 +108,30 @@ fuzz_target!(|input: &[u8]| {
         // Either may reject this input, but neither may panic.
         if let Ok(service) = harness.program.http_service(config).await {
             let _ = service.handle(request).await;
+
+            // ProxyHandler workers are Tokio tasks which intentionally remain
+            // resident until their reuse or idle limit is reached. Exhaust the
+            // tiny fuzzed reuse limit, then drive task cleanup before
+            // libFuzzer performs its per-input leak check.
+            for _ in 1..reuse_limit {
+                if service.state() == HttpServiceState::NoResidentWorker {
+                    break;
+                }
+                let _ = service
+                    .handle(HttpRequest::new(
+                        "POST",
+                        "http://localhost/tools/call",
+                        b"{}",
+                    ))
+                    .await;
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while service.state() != HttpServiceState::NoResidentWorker {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("single-use fuzz workers must stop");
         }
     });
 });
