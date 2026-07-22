@@ -130,7 +130,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
         with:
-          targets: wasm32-wasip1, wasm32-wasip2
+          targets: wasm32-unknown-unknown, wasm32-wasip1, wasm32-wasip2
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -164,3 +164,4 @@ jobs:
           tests/fixtures/json-http-tool.component.wasm
           tests/fixtures/oversized-output.component.wasm
           tests/fixtures/p2-http-hello.component.wasm
+          tests/fixtures/wasix-checkpoint-number.wasm

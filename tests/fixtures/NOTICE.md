@@ -35,3 +35,9 @@ Both WASI HTTP 0.2 fixtures are componentized with Wasmtime 46.0.1's official
 `oversized_output.rs` source with the pinned Rust toolchain's standard
 `wasm32-wasip2` target. It is used only to prove bounded stdout handling. Its
 SHA-256 is `d27c3e2904499dc70ef601009763dd8867adc811320cdbedce2628a1635fdbbf`.
+
+`wasix-checkpoint-number.wasm` is built from the adjacent `no_std` Rust source
+with Rust 1.94.0's `wasm32-unknown-unknown` target, then transformed with
+Binaryen `version_131` Asyncify. Binaryen is licensed under Apache-2.0. The
+fixture's SHA-256 is
+`8be7489cc7ab13ea4c33cf7d6547a6a9ba00da257baf12b803caef29bb63698a`.
