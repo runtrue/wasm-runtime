@@ -51,6 +51,19 @@ metadata, or authentication key makes an entry incompatible.
 - Cache entries are bounded by count and bytes with deterministic LRU
   eviction.
 
+The optional WASIX backend is deployed as a separate Linux worker. Before a
+worker emits its Ready frame, it lowers its core-file and open-file limits,
+removes root credentials and Linux capabilities, sets `no_new_privs`, and
+disables dumpability. It also closes inherited host file descriptors above
+standard error. The parent rejects a Ready frame that does not report every
+required postcondition or the deployment's exact supplementary-group
+allowlist. No guest request, module, package, or checkpoint may be sent before
+that validation succeeds.
+
+This worker bootstrap is an inner hardening layer, not a complete tenant
+sandbox. In particular, rlimits do not provide reliable resident-memory,
+aggregate-process, wall-clock, network, mount, or filesystem isolation.
+
 This model does not yet claim multi-tenant process isolation. Run mutually
 hostile tenants in separate OS sandboxes and add host network policy around the
 process. See the [production isolation boundary](production-isolation.md) for

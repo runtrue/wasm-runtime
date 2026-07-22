@@ -29,3 +29,22 @@ the crate does not install a service by itself.
 
 Apply the runtime-level rules in the [security and capability model](security.md)
 inside this OS boundary. Neither layer replaces the other.
+
+## WASIX worker startup
+
+Install the `runtrue-wasix-worker` executable at a root- or
+administrator-controlled, non-symlink path. Run it from a dedicated service
+account with no supplementary groups. A worker started with root
+credentials drops all real, effective, saved, and filesystem user and group
+IDs to numeric ID 65534 and clears supplementary groups before reporting
+Ready; an already unprivileged worker retains its deployment identity. The
+parent rejects all supplementary groups by default; deployments that genuinely
+require non-root groups must list the exact IDs with
+`with_allowed_supplementary_groups`.
+
+For every execution, the parent must create the worker process group, attach
+the process to its per-invocation cgroup, validate the isolated Ready frame,
+and only then send framed guest-controlled bytes. CPU, RSS memory, process
+count, wall-clock time, network access, and writable paths remain host policy.
+The Ready frame is a compatibility and postcondition report from a trusted
+executable, not cryptographic proof of isolation.
