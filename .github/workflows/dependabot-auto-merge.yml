@@ -1,0 +1,173 @@
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# This workflow runs trusted code from the default branch and never checks out
+# the pull request. Keep these permissions scoped to this workflow only.
+permissions:
+  checks: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-safe-update:
+    name: Merge safe dependency update
+    if: >-
+      github.repository == 'runtrue/wasm-runtime' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Read verified Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select low-risk updates
+        id: policy
+        env:
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          MAINTAINER_CHANGES: ${{ steps.metadata.outputs.maintainer-changes }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        shell: bash
+        run: |
+          eligible=false
+          if [[ "$UPDATE_TYPE" == "version-update:semver-patch" ]] &&
+             [[ "$MAINTAINER_CHANGES" == "false" ]] &&
+             [[ "$ECOSYSTEM" == "cargo" || "$ECOSYSTEM" == "github-actions" ]]; then
+            eligible=true
+          fi
+
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Dependabot merge policy"
+            echo
+            echo "- Ecosystem: \`$ECOSYSTEM\`"
+            echo "- Update: \`$UPDATE_TYPE\`"
+            echo "- Maintainer changes: \`$MAINTAINER_CHANGES\`"
+            echo "- Eligible: \`$eligible\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for the matching CI checks
+        if: steps.policy.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          required_checks=(
+            "Rust quality and package"
+            "Dependency policy and advisories"
+            "Reproducible WASI fixtures"
+          )
+
+          while IFS= read -r changed_file; do
+            case "$changed_file" in
+              fuzz/*|.github/workflows/fuzz.yml|Cargo.toml|Cargo.lock|src/*|tests/fixtures/*)
+                required_checks+=("Runtime trust boundaries")
+                break
+                ;;
+            esac
+          done < <(
+            gh api --paginate \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              --jq '.[].filename'
+          )
+
+          deadline=$((SECONDS + 2700))
+          while (( SECONDS < deadline )); do
+            check_runs="$(
+              gh api "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100"
+            )"
+            waiting=()
+
+            for check_name in "${required_checks[@]}"; do
+              state="$(
+                jq -r --arg name "$check_name" '
+                  [.check_runs[]
+                    | select(.name == $name and .app.slug == "github-actions")]
+                  | sort_by(.id)
+                  | last
+                  | if . == null then
+                      "missing:"
+                    else
+                      "\(.status):\(.conclusion // "")"
+                    end
+                ' <<< "$check_runs"
+              )"
+
+              case "$state" in
+                completed:success) ;;
+                completed:*)
+                  echo "$check_name did not pass ($state)" >&2
+                  exit 1
+                  ;;
+                *) waiting+=("$check_name ($state)") ;;
+              esac
+            done
+
+            if (( ${#waiting[@]} == 0 )); then
+              printf 'All required checks passed for %s\n' "$HEAD_SHA"
+              exit 0
+            fi
+
+            printf 'Waiting for: %s\n' "${waiting[*]}"
+            sleep 30
+          done
+
+          echo "Timed out waiting for required checks" >&2
+          exit 1
+
+      - name: Verify immutable merge inputs
+        if: steps.policy.outputs.eligible == 'true'
+        id: merge-inputs
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          current_head_sha="$(
+            gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha'
+          )"
+          current_base_sha="$(
+            gh api "repos/$REPOSITORY/commits/$BASE_REF" --jq '.sha'
+          )"
+
+          if [[ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "Dependabot updated the PR; the replacement run will evaluate it" >&2
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$current_base_sha" != "$EVENT_BASE_SHA" ]]; then
+            echo "The base branch moved; waiting for Dependabot to rebase" >&2
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "merge=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Squash and merge
+        if: >-
+          steps.policy.outputs.eligible == 'true' &&
+          steps.merge-inputs.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: >-
+          gh pr merge "$PR_URL"
+          --squash
+          --delete-branch
+          --match-head-commit "$HEAD_SHA"

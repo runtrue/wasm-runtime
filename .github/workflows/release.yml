@@ -40,9 +40,12 @@ jobs:
         with:
           cache-on-failure: true
           cache-bin: true
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: release
 
       - name: Verify source, tests, docs, version, and package
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: scripts/release-check.sh "${{ github.ref_name }}"
 
       - name: Install pinned SBOM generator

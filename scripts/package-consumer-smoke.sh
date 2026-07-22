@@ -7,7 +7,15 @@ cd "$repository_root"
 version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
 workspace="$(mktemp -d)"
 trap 'rm -rf "$workspace"' EXIT
-package_target="$workspace/package-build"
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    if [[ "$CARGO_TARGET_DIR" = /* ]]; then
+        package_target="$CARGO_TARGET_DIR"
+    else
+        package_target="$repository_root/$CARGO_TARGET_DIR"
+    fi
+else
+    package_target="$workspace/package-build"
+fi
 archive="$package_target/package/runtrue-wasm-runtime-$version.crate"
 
 package_arguments=(--locked --target-dir "$package_target")
