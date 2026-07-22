@@ -11,13 +11,59 @@ const WORKER: &str = env!("CARGO_BIN_EXE_runtrue-wasix-worker");
 
 #[tokio::test]
 async fn validates_the_explicit_worker_build_and_fresh_process() {
-    let metadata = probe_wasix_worker(&WasixWorkerConfig::new(WORKER))
-        .await
-        .unwrap();
+    let expected_groups = expected_worker_groups();
+    let config = WasixWorkerConfig::new(WORKER)
+        .with_allowed_supplementary_groups(expected_groups.iter().copied());
+    let metadata = probe_wasix_worker(&config).await.unwrap();
     assert_eq!(metadata.protocol_version, WASIX_WORKER_PROTOCOL_VERSION);
     assert_eq!(metadata.runtime_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(metadata.cohort_id, WASIX_COHORT_ID);
     assert_ne!(metadata.process_id, std::process::id());
+    let isolation = metadata.isolation;
+    assert_eq!(isolation.profile_version, 1);
+    assert!(!isolation.user_ids.contains(&0));
+    assert!(!isolation.group_ids.contains(&0));
+    assert!(!isolation.has_root_supplementary_group);
+    assert!(isolation.no_new_privileges);
+    assert!(!isolation.dumpable);
+    assert_eq!(isolation.capability_masks, [0; 4]);
+    assert_eq!(isolation.core_file_limits, [0; 2]);
+    assert_eq!(isolation.open_file_limits[0], isolation.open_file_limits[1]);
+    assert!((1..=64).contains(&isolation.open_file_limits[0]));
+    assert_eq!(isolation.supplementary_group_ids, expected_groups);
+
+    if rustix::process::geteuid().is_root() {
+        assert_eq!(isolation.user_ids, [65_534; 4]);
+        assert_eq!(isolation.group_ids, [65_534; 4]);
+        assert!(isolation.supplementary_group_ids.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn closes_inherited_host_descriptors_before_ready() {
+    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let wrapper = directory.path().join("worker-wrapper");
+    let mut executable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&wrapper)
+        .unwrap();
+    writeln!(executable, "#!/bin/sh\nexec '{WORKER}' \"$@\"").unwrap();
+    executable.sync_all().unwrap();
+    drop(executable);
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let sentinel = tempfile::tempfile().unwrap();
+    rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::empty()).unwrap();
+    let metadata = probe_wasix_worker(
+        &WasixWorkerConfig::new(wrapper)
+            .with_allowed_supplementary_groups(expected_worker_groups()),
+    )
+    .await
+    .unwrap();
+    assert!(metadata.isolation.closed_inherited_descriptor_count >= 1);
 }
 
 #[tokio::test]
@@ -144,4 +190,18 @@ async fn wait_for_process_exit(pid: rustix::process::Pid) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("worker descendant {pid:?} survived process-group cleanup");
+}
+
+fn expected_worker_groups() -> Vec<u32> {
+    if rustix::process::geteuid().is_root() {
+        return Vec::new();
+    }
+    let mut groups: Vec<_> = rustix::process::getgroups()
+        .unwrap()
+        .into_iter()
+        .map(rustix::process::Gid::as_raw)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
 }
