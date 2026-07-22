@@ -40,6 +40,9 @@ pub enum Error {
     /// Authenticated cache state was invalid and could not be recovered.
     #[error("AOT cache failed: {0}")]
     Cache(String),
+    /// A WASIX checkpoint artifact was invalid or incompatible.
+    #[error("WASIX checkpoint failed: {0}")]
+    Checkpoint(String),
 }
 
 impl From<io::Error> for Error {
