@@ -1,3 +1,5 @@
+#[cfg(feature = "wasix-checkpoint")]
+use crate::{CapturedWasixJournal, CommandInput};
 use crate::{Error, Result, VerifiedWasixCheckpoint, WasixCheckpointBinding};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -26,7 +28,7 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 5;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 6;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
@@ -34,6 +36,7 @@ pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
 const WASIX_WORKER_ISOLATION_PROFILE_VERSION: u32 = 2;
 const WASIX_WORKER_MAX_OPEN_FILES: u64 = 64;
 const WASIX_WORKER_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const WASIX_WORKER_MAX_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WASIX_WORKER_MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,6 +45,14 @@ const WASIX_WORKER_MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 const WASIX_WORKER_MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(feature = "wasix-checkpoint")]
 const WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_CAPTURE_REQUEST_BYTES: usize = 64 * 1024;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_CAPTURE_ARGUMENTS: usize = 256;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_CAPTURE_ENVIRONMENT: usize = 256;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_CAPTURE_VALUE_BYTES: usize = 4 * 1024;
 #[cfg(target_os = "linux")]
 const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::SEAL
     .union(rustix::fs::SealFlags::SHRINK)
@@ -52,7 +63,7 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 ///
 /// The executable is a deployment trust anchor and must be installed at a
 /// trusted, administrator-controlled path. The protocol probe checks reported
-/// compatibility; it is not a signature over the executable. Version 5 of the
+/// compatibility; it is not a signature over the executable. Version 6 of the
 /// worker process boundary is supported on Linux only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasixWorkerConfig {
@@ -247,6 +258,49 @@ pub struct WasixCheckpointRestoreMetadata {
     pub journal_sha256: String,
 }
 
+/// Trusted journal capture produced by a fresh isolated source worker.
+#[cfg(feature = "wasix-checkpoint")]
+pub struct WasixCheckpointCapture {
+    /// Compatibility and isolation state of the source worker.
+    pub worker: WasixWorkerMetadata,
+    /// Workload identity to which the captured journal will be sealed.
+    pub binding: WasixCheckpointBinding,
+    /// Bounded output emitted before the explicit snapshot.
+    pub stdout: Vec<u8>,
+    /// Bounded error output emitted before the explicit snapshot.
+    pub stderr: Vec<u8>,
+    /// Lowercase SHA-256 digest of the executed module.
+    pub module_sha256: String,
+    /// Lowercase SHA-256 digest of the captured journal prefix.
+    pub journal_sha256: String,
+    journal: CapturedWasixJournal,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl std::fmt::Debug for WasixCheckpointCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasixCheckpointCapture")
+            .field("worker", &self.worker)
+            .field("binding", &self.binding)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("module_sha256", &self.module_sha256)
+            .field("journal_sha256", &self.journal_sha256)
+            .field("journal", &self.journal)
+            .finish()
+    }
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl WasixCheckpointCapture {
+    /// Attested journal that can be authenticated with [`crate::WasixCheckpointCodec`].
+    #[must_use]
+    pub const fn journal(&self) -> &CapturedWasixJournal {
+        &self.journal
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WasixCheckpointTransportAck {
@@ -271,6 +325,37 @@ struct WasixCheckpointRestoreCompletion {
     exit_code: i32,
     stdout_bytes: u64,
     stdout_sha256: String,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointCaptureRequest {
+    arguments: Vec<String>,
+    environment: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointCaptureAck {
+    module_bytes: u64,
+    module_sha256: String,
+    request_bytes: u64,
+    request_sha256: String,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointCaptureCompletion {
+    exit_code: i32,
+    journal_bytes: u64,
+    journal_sha256: String,
+    stdout_bytes: u64,
+    stdout_sha256: String,
+    stderr_bytes: u64,
+    stderr_sha256: String,
 }
 
 impl WasixCheckpointTransportAck {
@@ -324,6 +409,83 @@ impl WasixCheckpointRestoreCompletion {
     }
 }
 
+#[cfg(feature = "wasix-checkpoint")]
+impl WasixCheckpointCaptureRequest {
+    fn new(input: CommandInput) -> Result<(Self, Duration, crate::CancellationToken)> {
+        if !input.stdin.is_empty() {
+            return Err(Error::Configuration(
+                "WASIX checkpoint capture does not yet support standard input".to_owned(),
+            ));
+        }
+        if input.timeout.is_zero() || input.timeout > MAX_HANDSHAKE_TIMEOUT {
+            return Err(Error::Configuration(
+                "WASIX checkpoint capture timeout must be between zero and 30 seconds".to_owned(),
+            ));
+        }
+        let request = Self {
+            arguments: input.args,
+            environment: input.env,
+        };
+        request.validate().map_err(Error::Configuration)?;
+        Ok((request, input.timeout, input.cancellation))
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.arguments.len() > WASIX_WORKER_MAX_CAPTURE_ARGUMENTS
+            || self.environment.len() > WASIX_WORKER_MAX_CAPTURE_ENVIRONMENT
+        {
+            return Err("WASIX checkpoint capture input contains too many entries".to_owned());
+        }
+        for argument in &self.arguments {
+            validate_capture_value("argument", argument, WASIX_WORKER_MAX_CAPTURE_VALUE_BYTES)?;
+        }
+        for (key, value) in &self.environment {
+            if key.is_empty() || key.contains('=') {
+                return Err("WASIX checkpoint capture environment key is invalid".to_owned());
+            }
+            validate_capture_value("environment key", key, 256)?;
+            validate_capture_value(
+                "environment value",
+                value,
+                WASIX_WORKER_MAX_CAPTURE_VALUE_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+fn validate_capture_value(
+    label: &str,
+    value: &str,
+    maximum: usize,
+) -> std::result::Result<(), String> {
+    if value.len() > maximum || value.contains('\0') {
+        return Err(format!("WASIX checkpoint capture {label} is invalid"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl WasixCheckpointCaptureCompletion {
+    fn validate(&self, journal: &[u8], stdout: &[u8], stderr: &[u8]) -> Result<()> {
+        let matches = |bytes: &[u8], expected_bytes: u64, expected_sha256: &str| {
+            u64::try_from(bytes.len()).ok() == Some(expected_bytes)
+                && hex::encode(Sha256::digest(bytes)) == expected_sha256
+        };
+        if self.exit_code != 0
+            || !matches(journal, self.journal_bytes, &self.journal_sha256)
+            || !matches(stdout, self.stdout_bytes, &self.stdout_sha256)
+            || !matches(stderr, self.stderr_bytes, &self.stderr_sha256)
+        {
+            return Err(Error::Execution(
+                "WASIX worker capture completion did not match its output".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Worker isolation postconditions established before accepting guest input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -348,6 +510,8 @@ pub struct WasixWorkerIsolation {
     pub core_file_limits: [u64; 2],
     /// Effective and hard per-file size limits, in bytes.
     pub file_size_limits: [u64; 2],
+    /// Effective and hard virtual-address-space limits, in bytes.
+    pub address_space_limits: [u64; 2],
     /// Effective and hard open-file descriptor limits.
     pub open_file_limits: [u64; 2],
     /// Number of inherited descriptors at or above three closed before Ready.
@@ -400,10 +564,22 @@ impl WasixWorkerIsolation {
                 "WASIX worker did not disable core files".to_owned(),
             ));
         }
-        if self.file_size_limits != [WASIX_WORKER_MAX_FILE_BYTES; 2] {
+        let [file_size, hard_file_size] = self.file_size_limits;
+        if file_size != hard_file_size || file_size == 0 || file_size > WASIX_WORKER_MAX_FILE_BYTES
+        {
             return Err(Error::Execution(format!(
-                "WASIX worker file-size limits {:?} differ from the isolation profile",
+                "WASIX worker file-size limits {:?} exceed the isolation profile",
                 self.file_size_limits
+            )));
+        }
+        let [address_space, hard_address_space] = self.address_space_limits;
+        if address_space != hard_address_space
+            || address_space == 0
+            || address_space > WASIX_WORKER_MAX_ADDRESS_SPACE_BYTES
+        {
+            return Err(Error::Execution(format!(
+                "WASIX worker address-space limits {:?} exceed the isolation profile",
+                self.address_space_limits
             )));
         }
         let [open_files, hard_open_files] = self.open_file_limits;
@@ -432,6 +608,7 @@ impl WasixWorkerIsolation {
             capability_masks: [0; 4],
             core_file_limits: [0; 2],
             file_size_limits: [WASIX_WORKER_MAX_FILE_BYTES; 2],
+            address_space_limits: [WASIX_WORKER_MAX_ADDRESS_SPACE_BYTES; 2],
             open_file_limits: [WASIX_WORKER_MAX_OPEN_FILES; 2],
             closed_inherited_descriptor_count: 0,
         }
@@ -547,6 +724,149 @@ pub async fn restore_wasix_checkpoint(
             "WASIX checkpoint restore currently requires Linux".to_owned(),
         ))
     }
+}
+
+/// Capture an explicit WASIX snapshot in a fresh isolated source worker.
+///
+/// Authentication remains a parent concern: this returns a non-forgeable
+/// journal that callers can pass to [`crate::WasixCheckpointCodec::seal`].
+/// Standard input is rejected in this first capture protocol revision.
+///
+/// # Errors
+///
+/// Returns an error for invalid input or binding, timeout, cancellation,
+/// worker protocol failure, a missing explicit snapshot, or bounded-output
+/// overflow.
+#[cfg(feature = "wasix-checkpoint")]
+pub async fn capture_wasix_checkpoint(
+    config: &WasixWorkerConfig,
+    binding: WasixCheckpointBinding,
+    module: Vec<u8>,
+    input: CommandInput,
+) -> Result<WasixCheckpointCapture> {
+    config.validate()?;
+    let (request, execution_timeout, cancellation) = WasixCheckpointCaptureRequest::new(input)?;
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        capture_wasix_checkpoint_linux(
+            config,
+            binding,
+            module,
+            request,
+            execution_timeout,
+            cancellation,
+        )
+        .await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (binding, module, request, execution_timeout, cancellation);
+        Err(Error::Configuration(
+            "WASIX checkpoint capture currently requires Linux".to_owned(),
+        ))
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn capture_wasix_checkpoint_linux(
+    config: &WasixWorkerConfig,
+    binding: WasixCheckpointBinding,
+    module: Vec<u8>,
+    request: WasixCheckpointCaptureRequest,
+    execution_timeout: Duration,
+    cancellation: crate::CancellationToken,
+) -> Result<WasixCheckpointCapture> {
+    if binding.command() != "_start" {
+        return Err(Error::UnsupportedComponent(
+            "WASIX checkpoint capture supports only the \"_start\" command".to_owned(),
+        ));
+    }
+    if module.is_empty() || module.len() > WASIX_WORKER_MAX_MODULE_BYTES {
+        return Err(Error::Checkpoint(
+            "WASIX capture module exceeds the worker input limit".to_owned(),
+        ));
+    }
+    let request = serde_json::to_vec(&request).map_err(|error| {
+        Error::Configuration(format!("capture request encoding failed: {error}"))
+    })?;
+    if request.is_empty() || request.len() > WASIX_WORKER_MAX_CAPTURE_REQUEST_BYTES {
+        return Err(Error::Configuration(
+            "WASIX checkpoint capture request exceeds the protocol limit".to_owned(),
+        ));
+    }
+    let request_bytes = u64::try_from(request.len())
+        .map_err(|_| Error::Configuration("capture request length overflows u64".to_owned()))?;
+    let request_sha256 = hex::encode(Sha256::digest(&request));
+    let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+    let preparation = ModulePreparation::new(module);
+    let prepared_module = tokio::select! {
+        () = cancellation.cancelled() => return Err(Error::Cancelled),
+        result = preparation.wait(config.handshake_timeout) => result?,
+    };
+    if prepared_module.sha256 != binding.module_sha256() {
+        return Err(Error::Checkpoint(
+            "WASIX capture module does not match the checkpoint binding".to_owned(),
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout);
+    }
+
+    let (control, child_control) = checkpoint_control_channel()?;
+    let mut command = Command::new(&config.executable);
+    command
+        .arg("--checkpoint-capture")
+        .env_clear()
+        .current_dir("/")
+        .stdin(child_control)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().map_err(|error| {
+        Error::Execution(format!(
+            "failed to spawn WASIX capture worker {}: {error}",
+            config.executable.display()
+        ))
+    })?;
+    drop(command);
+    let mut worker = WorkerProcess::new(child)?;
+    let stdout =
+        worker.child.stdout.take().ok_or_else(|| {
+            Error::Execution("WASIX capture worker stdout was not piped".to_owned())
+        })?;
+    let expected = ExpectedCheckpointCapture {
+        binding,
+        module_bytes: prepared_module.bytes,
+        module_sha256: prepared_module.sha256,
+        request_bytes,
+        request_sha256,
+    };
+    let capture_input = CheckpointCaptureInput {
+        control: Some(control),
+        module: Some(prepared_module.file),
+        request,
+        expected,
+    };
+    let (cancel, cancelled) = oneshot::channel();
+    let operation = CheckpointCaptureOperation {
+        handshake_timeout: remaining,
+        execution_timeout,
+        allowed_supplementary_groups: config.allowed_supplementary_groups.clone(),
+        input: capture_input,
+        cancellation,
+    };
+    let supervisor = tokio::spawn(supervise_checkpoint_capture(
+        worker, stdout, operation, cancelled,
+    ));
+    CheckpointCaptureSupervisor::new(supervisor, cancel)
+        .wait()
+        .await
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -948,6 +1268,32 @@ struct CheckpointRestoreInput {
     expected: ExpectedCheckpointRestore,
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct ExpectedCheckpointCapture {
+    binding: WasixCheckpointBinding,
+    module_bytes: u64,
+    module_sha256: String,
+    request_bytes: u64,
+    request_sha256: String,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CheckpointCaptureInput {
+    control: Option<tokio::net::UnixStream>,
+    module: Option<std::fs::File>,
+    request: Vec<u8>,
+    expected: ExpectedCheckpointCapture,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CheckpointCaptureOperation {
+    handshake_timeout: Duration,
+    execution_timeout: Duration,
+    allowed_supplementary_groups: Vec<u32>,
+    input: CheckpointCaptureInput,
+    cancellation: crate::CancellationToken,
+}
+
 #[cfg(target_os = "linux")]
 fn checkpoint_control_channel() -> Result<(tokio::net::UnixStream, Stdio)> {
     use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -1216,6 +1562,158 @@ async fn perform_checkpoint_restore(
     })
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn supervise_checkpoint_capture(
+    mut worker: WorkerProcess,
+    mut stdout: tokio::process::ChildStdout,
+    mut operation: CheckpointCaptureOperation,
+    mut cancelled: oneshot::Receiver<()>,
+) -> Result<WasixCheckpointCapture> {
+    let process_id = worker.process_id;
+    let cancellation = operation.cancellation.clone();
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut cancelled => Err(Error::Cancelled),
+        () = cancellation.cancelled() => Err(Error::Cancelled),
+        result = perform_checkpoint_capture(
+            &mut worker,
+            &mut stdout,
+            process_id,
+            &operation.allowed_supplementary_groups,
+            operation.handshake_timeout,
+            operation.execution_timeout,
+            &mut operation.input,
+        ) => result,
+    };
+    if outcome.is_err() && worker.active {
+        drop(stdout);
+        spawn_worker_reaper(worker);
+    }
+    outcome
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn perform_checkpoint_capture(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+    process_id: u32,
+    allowed_supplementary_groups: &[u32],
+    handshake_timeout: Duration,
+    execution_timeout: Duration,
+    input: &mut CheckpointCaptureInput,
+) -> Result<WasixCheckpointCapture> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (metadata, acknowledgement) = tokio::time::timeout(handshake_timeout, async {
+        let ready = read_frame(stdout).await?;
+        let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready).map_err(|error| {
+            Error::Execution(format!("invalid WASIX capture Ready frame: {error}"))
+        })?;
+        metadata.validate(process_id, allowed_supplementary_groups)?;
+        let control = input
+            .control
+            .as_mut()
+            .ok_or_else(|| Error::Execution("capture control socket is unavailable".to_owned()))?;
+        let module = input
+            .module
+            .as_ref()
+            .ok_or_else(|| Error::Execution("sealed capture module is unavailable".to_owned()))?;
+        send_checkpoint_descriptor(control, module, b'M').await?;
+        write_control_frame(control, &input.request).await?;
+        let frame = read_frame(stdout).await?;
+        let acknowledgement: WasixCheckpointCaptureAck =
+            serde_json::from_slice(&frame).map_err(|error| {
+                Error::Execution(format!("invalid WASIX capture acknowledgement: {error}"))
+            })?;
+        if acknowledgement.module_bytes != input.expected.module_bytes
+            || acknowledgement.module_sha256 != input.expected.module_sha256
+            || acknowledgement.request_bytes != input.expected.request_bytes
+            || acknowledgement.request_sha256 != input.expected.request_sha256
+        {
+            return Err(Error::Execution(
+                "WASIX capture acknowledgement did not match the sealed inputs".to_owned(),
+            ));
+        }
+        control.write_all(b"E").await.map_err(|error| {
+            Error::Execution(format!("failed to authorize WASIX capture: {error}"))
+        })?;
+        control.shutdown().await.map_err(|error| {
+            Error::Execution(format!(
+                "failed to finish WASIX capture authorization: {error}"
+            ))
+        })?;
+        input.control.take();
+        input.module.take();
+        Ok((metadata, acknowledgement))
+    })
+    .await
+    .map_err(|_| Error::Timeout)??;
+
+    let (completion, journal, captured_stdout, captured_stderr) =
+        tokio::time::timeout(execution_timeout, async {
+            let frame = read_frame(stdout).await?;
+            let completion: WasixCheckpointCaptureCompletion = serde_json::from_slice(&frame)
+                .map_err(|error| {
+                    Error::Execution(format!("invalid WASIX capture completion: {error}"))
+                })?;
+            let journal = read_bounded_worker_frame(
+                stdout,
+                WASIX_WORKER_MAX_CHECKPOINT_BYTES,
+                false,
+                "capture journal",
+            )
+            .await?;
+            let captured_stdout = read_bounded_worker_frame(
+                stdout,
+                WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+                true,
+                "capture stdout",
+            )
+            .await?;
+            let captured_stderr = read_bounded_worker_frame(
+                stdout,
+                WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+                true,
+                "capture stderr",
+            )
+            .await?;
+            completion.validate(&journal, &captured_stdout, &captured_stderr)?;
+            finish_worker_output(worker, stdout, "checkpoint capture").await?;
+            Ok::<_, Error>((completion, journal, captured_stdout, captured_stderr))
+        })
+        .await
+        .map_err(|_| Error::Timeout)??;
+    let journal = CapturedWasixJournal::from_attested_worker_capture(
+        journal,
+        acknowledgement.module_sha256.clone(),
+    )?;
+    Ok(WasixCheckpointCapture {
+        worker: metadata,
+        binding: input.expected.binding.clone(),
+        stdout: captured_stdout,
+        stderr: captured_stderr,
+        module_sha256: acknowledgement.module_sha256,
+        journal_sha256: completion.journal_sha256,
+        journal,
+    })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn write_control_frame(control: &mut tokio::net::UnixStream, frame: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let length = u32::try_from(frame.len())
+        .map_err(|_| Error::Configuration("capture request length overflows u32".to_owned()))?;
+    control
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| Error::Execution(format!("failed to send capture request: {error}")))?;
+    control
+        .write_all(frame)
+        .await
+        .map_err(|error| Error::Execution(format!("failed to send capture request: {error}")))
+}
+
 async fn supervise_probe(
     mut worker: WorkerProcess,
     mut stdout: tokio::process::ChildStdout,
@@ -1370,6 +1868,44 @@ impl Drop for CheckpointRestoreSupervisor {
     }
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CheckpointCaptureSupervisor {
+    task: tokio::task::JoinHandle<Result<WasixCheckpointCapture>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl CheckpointCaptureSupervisor {
+    const fn new(
+        task: tokio::task::JoinHandle<Result<WasixCheckpointCapture>>,
+        cancel: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            task,
+            cancel: Some(cancel),
+        }
+    }
+
+    async fn wait(mut self) -> Result<WasixCheckpointCapture> {
+        let outcome = (&mut self.task).await.map_err(|error| {
+            Error::Execution(format!(
+                "WASIX checkpoint capture supervisor failed: {error}"
+            ))
+        })?;
+        self.cancel.take();
+        outcome
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl Drop for CheckpointCaptureSupervisor {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 impl CheckpointTransportSupervisor {
     const fn new(
         task: tokio::task::JoinHandle<Result<WasixCheckpointTransportMetadata>>,
@@ -1462,7 +1998,11 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
             "WASIX worker frame length {length} is invalid"
         )));
     }
-    let mut frame = vec![0_u8; length];
+    let mut frame = Vec::new();
+    frame.try_reserve_exact(length).map_err(|error| {
+        Error::Execution(format!("failed to allocate WASIX worker frame: {error}"))
+    })?;
+    frame.resize(length, 0);
     reader
         .read_exact(&mut frame)
         .await
@@ -1472,22 +2012,41 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
 
 #[cfg(feature = "wasix-checkpoint")]
 async fn read_output_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+    read_bounded_worker_frame(
+        reader,
+        WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+        true,
+        "restore output",
+    )
+    .await
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+async fn read_bounded_worker_frame(
+    reader: &mut (impl AsyncRead + Unpin),
+    maximum: usize,
+    allow_empty: bool,
+    label: &str,
+) -> Result<Vec<u8>> {
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length).await.map_err(|error| {
-        Error::Execution(format!(
-            "failed to read WASIX restore output length: {error}"
-        ))
+        Error::Execution(format!("failed to read WASIX {label} length: {error}"))
     })?;
     let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-    if length > WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES {
+    if (!allow_empty && length == 0) || length > maximum {
         return Err(Error::Execution(format!(
-            "WASIX restore output length {length} exceeds the protocol limit"
+            "WASIX {label} length {length} is invalid"
         )));
     }
-    let mut frame = vec![0_u8; length];
-    reader.read_exact(&mut frame).await.map_err(|error| {
-        Error::Execution(format!("failed to read WASIX restore output: {error}"))
-    })?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(length)
+        .map_err(|error| Error::Execution(format!("failed to allocate WASIX {label}: {error}")))?;
+    frame.resize(length, 0);
+    reader
+        .read_exact(&mut frame)
+        .await
+        .map_err(|error| Error::Execution(format!("failed to read WASIX {label}: {error}")))?;
     Ok(frame)
 }
 
@@ -1517,6 +2076,8 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
     let closed_inherited_descriptor_count = close_inherited_worker_descriptors()?;
     let core_file_limits = lower_worker_limit(Resource::Core, 0)?;
     let file_size_limits = lower_worker_limit(Resource::Fsize, WASIX_WORKER_MAX_FILE_BYTES)?;
+    let address_space_limits =
+        lower_worker_limit(Resource::As, WASIX_WORKER_MAX_ADDRESS_SPACE_BYTES)?;
     let open_file_limits = lower_worker_limit(Resource::Nofile, WASIX_WORKER_MAX_OPEN_FILES)?;
 
     rustix::thread::set_keep_capabilities(false)
@@ -1599,6 +2160,7 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
         ],
         core_file_limits,
         file_size_limits,
+        address_space_limits,
         open_file_limits,
         closed_inherited_descriptor_count,
     };
@@ -1915,6 +2477,124 @@ pub fn write_wasix_checkpoint_restore(
     write_worker_output_frame(&mut writer, &stdout)
 }
 
+/// Capture one explicit WASIX snapshot in an isolated source worker.
+#[doc(hidden)]
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+pub fn write_wasix_checkpoint_capture(
+    mut reader: impl std::io::Read + std::os::fd::AsFd,
+    mut writer: impl Write,
+) -> std::result::Result<(), String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let isolation = enter_wasix_worker_isolation()?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
+        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    write_worker_frame(&mut writer, &ready)?;
+
+    let module = receive_checkpoint_descriptor(&reader, b'M', "module")?;
+    let module_metadata =
+        inspect_sealed_worker_input(&module, WASIX_WORKER_MAX_MODULE_BYTES, "module")?;
+    let request_bytes = read_worker_control_frame(
+        &mut reader,
+        WASIX_WORKER_MAX_CAPTURE_REQUEST_BYTES,
+        "capture request",
+    )?;
+    let request: WasixCheckpointCaptureRequest = serde_json::from_slice(&request_bytes)
+        .map_err(|error| format!("cannot decode capture request: {error}"))?;
+    request.validate()?;
+    let acknowledgement = WasixCheckpointCaptureAck {
+        module_bytes: module_metadata.bytes,
+        module_sha256: module_metadata.sha256,
+        request_bytes: u64::try_from(request_bytes.len())
+            .map_err(|_| "capture request length overflows u64".to_owned())?,
+        request_sha256: hex::encode(Sha256::digest(&request_bytes)),
+    };
+    let frame = serde_json::to_vec(&acknowledgement)
+        .map_err(|error| format!("cannot encode capture acknowledgement: {error}"))?;
+    write_worker_frame(&mut writer, &frame)?;
+    read_worker_execute_authorization(&mut reader, "capture")?;
+
+    let null = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|error| format!("cannot open null input for capture worker: {error}"))?;
+    rustix::stdio::dup2_stdin(&null)
+        .map_err(|error| format!("cannot clear capture worker stdin: {error}"))?;
+    drop(reader);
+
+    let captured = execute_wasix_checkpoint_capture(&module, module_metadata.bytes, request)?;
+    let completion = WasixCheckpointCaptureCompletion {
+        exit_code: captured.exit_code,
+        journal_bytes: u64::try_from(captured.journal.len())
+            .map_err(|_| "capture journal length overflows u64".to_owned())?,
+        journal_sha256: hex::encode(Sha256::digest(&captured.journal)),
+        stdout_bytes: u64::try_from(captured.stdout.len())
+            .map_err(|_| "capture stdout length overflows u64".to_owned())?,
+        stdout_sha256: hex::encode(Sha256::digest(&captured.stdout)),
+        stderr_bytes: u64::try_from(captured.stderr.len())
+            .map_err(|_| "capture stderr length overflows u64".to_owned())?,
+        stderr_sha256: hex::encode(Sha256::digest(&captured.stderr)),
+    };
+    let frame = serde_json::to_vec(&completion)
+        .map_err(|error| format!("cannot encode capture completion: {error}"))?;
+    write_worker_frame(&mut writer, &frame)?;
+    write_worker_bounded_frame(
+        &mut writer,
+        &captured.journal,
+        WASIX_WORKER_MAX_CHECKPOINT_BYTES,
+        false,
+        "capture journal",
+    )?;
+    write_worker_output_frame(&mut writer, &captured.stdout)?;
+    write_worker_output_frame(&mut writer, &captured.stderr)
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn read_worker_control_frame(
+    reader: &mut impl std::io::Read,
+    maximum: usize,
+    label: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut length = [0_u8; 4];
+    reader
+        .read_exact(&mut length)
+        .map_err(|error| format!("cannot read {label} length: {error}"))?;
+    let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+    if length == 0 || length > maximum {
+        return Err(format!("{label} length {length} is invalid"));
+    }
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(length)
+        .map_err(|error| format!("cannot allocate {label}: {error}"))?;
+    frame.resize(length, 0);
+    reader
+        .read_exact(&mut frame)
+        .map_err(|error| format!("cannot read {label}: {error}"))?;
+    Ok(frame)
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn read_worker_execute_authorization(
+    reader: &mut impl std::io::Read,
+    operation: &str,
+) -> std::result::Result<(), String> {
+    let mut authorization = [0_u8; 1];
+    reader
+        .read_exact(&mut authorization)
+        .map_err(|error| format!("cannot read {operation} authorization: {error}"))?;
+    if authorization != [b'E'] {
+        return Err(format!("{operation} authorization is malformed"));
+    }
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|error| format!("cannot finish {operation} authorization: {error}"))?
+        != 0
+    {
+        return Err(format!("{operation} authorization contains trailing bytes"));
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 #[cfg(all(feature = "wasix-checkpoint", not(target_os = "linux")))]
 pub fn write_wasix_checkpoint_restore(
@@ -1922,6 +2602,15 @@ pub fn write_wasix_checkpoint_restore(
     _writer: impl Write,
 ) -> std::result::Result<(), String> {
     Err("WASIX checkpoint restore requires Linux".to_owned())
+}
+
+#[doc(hidden)]
+#[cfg(all(feature = "wasix-checkpoint", not(target_os = "linux")))]
+pub fn write_wasix_checkpoint_capture(
+    _reader: impl Read,
+    _writer: impl Write,
+) -> std::result::Result<(), String> {
+    Err("WASIX checkpoint capture requires Linux".to_owned())
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -1932,7 +2621,7 @@ fn execute_wasix_checkpoint_restore(
 ) -> std::result::Result<(i32, Vec<u8>), String> {
     use crate::wasix_output::BoundedWasixOutput;
     use std::sync::Arc;
-    use wasmer::{Engine, Module};
+    use wasmer::Module;
     use wasmer_wasix::{
         PluggableRuntime, Runtime, UnsupportedVirtualNetworking, WasiEnvBuilder,
         bin_factory::spawn_exec_module,
@@ -1944,7 +2633,7 @@ fn execute_wasix_checkpoint_restore(
 
     let module_bytes = read_sealed_module_bytes(module, module_length)?;
 
-    let engine = Engine::default();
+    let engine = bounded_wasix_worker_engine();
     let module = Module::new(&engine, &module_bytes)
         .map_err(|error| format!("cannot compile sealed restore module: {error}"))?;
     drop(module_bytes);
@@ -1961,7 +2650,7 @@ fn execute_wasix_checkpoint_restore(
         .map_err(|error| format!("cannot initialize WASIX restore runtime: {error}"))?;
     let runtime_handle = tokio_runtime.handle().clone();
     let _runtime_guard = runtime_handle.enter();
-    let task_manager = Arc::new(TokioTaskManager::new(runtime_handle));
+    let task_manager = Arc::new(TokioTaskManager::new(runtime_handle.clone()));
     let mut concrete_runtime = PluggableRuntime::new(task_manager);
     concrete_runtime.set_engine(engine);
     concrete_runtime.set_networking_implementation(UnsupportedVirtualNetworking::default());
@@ -1994,6 +2683,200 @@ fn execute_wasix_checkpoint_restore(
         .finish()
         .map_err(|error| format!("cannot finish bounded restore output: {error}"))?;
     Ok((exit_code.raw(), output))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct ExecutedCheckpointCapture {
+    exit_code: i32,
+    journal: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn execute_wasix_checkpoint_capture(
+    module: &std::os::fd::OwnedFd,
+    module_length: u64,
+    request: WasixCheckpointCaptureRequest,
+) -> std::result::Result<ExecutedCheckpointCapture, String> {
+    use crate::wasix_output::BoundedWasixOutput;
+    use std::sync::Arc;
+    use wasmer::Module;
+    use wasmer_wasix::{
+        PluggableRuntime, Runtime, UnsupportedVirtualNetworking, WasiEnvBuilder,
+        bin_factory::spawn_exec_module,
+        journal::{LogFileJournal, SnapshotTrigger},
+        runtime::{
+            resolver::MultiSource,
+            task_manager::{VirtualTaskManagerExt, tokio::TokioTaskManager},
+        },
+    };
+
+    let module_bytes = read_sealed_module_bytes(module, module_length)?;
+    let engine = bounded_wasix_worker_engine();
+    let module = Module::new(&engine, &module_bytes)
+        .map_err(|error| format!("cannot compile sealed capture module: {error}"))?;
+    drop(module_bytes);
+    let module_hash = module
+        .info()
+        .hash()
+        .ok_or_else(|| "compiled capture module has no content hash".to_owned())?;
+    let expected_module_hash = module_hash.as_bytes().to_vec();
+
+    let journal_file = create_capture_journal_file()?;
+    let journal = Arc::new(
+        LogFileJournal::from_file(
+            journal_file
+                .try_clone()
+                .map_err(|error| format!("cannot clone capture journal memfd: {error}"))?,
+        )
+        .map_err(|error| format!("cannot open capture journal: {error}"))?,
+    );
+
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot initialize WASIX capture runtime: {error}"))?;
+    let runtime_handle = tokio_runtime.handle().clone();
+    let runtime_guard = runtime_handle.enter();
+    let task_manager = Arc::new(TokioTaskManager::new(runtime_handle.clone()));
+    let mut concrete_runtime = PluggableRuntime::new(task_manager);
+    concrete_runtime.set_engine(engine);
+    concrete_runtime.set_networking_implementation(UnsupportedVirtualNetworking::default());
+    concrete_runtime.http_client = None;
+    concrete_runtime.set_source(MultiSource::default());
+    concrete_runtime.add_writable_journal(journal.clone());
+    let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(concrete_runtime);
+
+    let stdout = BoundedWasixOutput::new(WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES)
+        .map_err(|error| format!("cannot allocate bounded capture stdout: {error}"))?;
+    let stderr = BoundedWasixOutput::new(WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES)
+        .map_err(|error| format!("cannot allocate bounded capture stderr: {error}"))?;
+    let mut builder = WasiEnvBuilder::new("checkpoint-source");
+    builder.set_runtime(runtime.clone());
+    builder.set_module_hash(module_hash);
+    builder.add_args(request.arguments);
+    builder.add_envs(request.environment);
+    builder.set_stdout(Box::new(stdout.clone()));
+    builder.set_stderr(Box::new(stderr.clone()));
+    builder.with_skip_stdio_during_bootstrap(true);
+    builder.add_snapshot_trigger(SnapshotTrigger::Explicit);
+    builder.with_stop_running_after_snapshot(true);
+    let environment = builder
+        .build()
+        .map_err(|error| format!("cannot build WASIX capture environment: {error}"))?;
+    let mut task = spawn_exec_module(module, environment, &runtime)
+        .map_err(|error| format!("cannot spawn WASIX capture process: {error}"))?;
+    let exit_code = runtime
+        .task_manager()
+        .spawn_and_block_on(async move { task.wait_finished().await })
+        .map_err(|error| format!("cannot join WASIX capture process: {error}"))?
+        .map_err(|error| format!("WASIX capture process failed: {error}"))?;
+    if !exit_code.is_success() {
+        return Err(format!("WASIX capture process exited with {exit_code}"));
+    }
+    drop(runtime);
+    drop(journal);
+    drop(runtime_guard);
+    drop(tokio_runtime);
+    let captured_stdout = stdout
+        .finish()
+        .map_err(|error| format!("cannot finish bounded capture stdout: {error}"))?;
+    let captured_stderr = stderr
+        .finish()
+        .map_err(|error| format!("cannot finish bounded capture stderr: {error}"))?;
+    let checkpoint_end = inspect_captured_journal(&journal_file, &expected_module_hash)?;
+    journal_file
+        .set_len(checkpoint_end)
+        .map_err(|error| format!("cannot truncate capture journal prefix: {error}"))?;
+    rustix::fs::fcntl_add_seals(&journal_file, REQUIRED_CHECKPOINT_SEALS)
+        .map_err(|error| format!("cannot seal capture journal: {error}"))?;
+    let accepted = inspect_sealed_worker_input(
+        &journal_file,
+        WASIX_WORKER_MAX_CHECKPOINT_BYTES,
+        "capture journal",
+    )?;
+    let captured_journal = read_sealed_module_bytes(&journal_file, accepted.bytes)?;
+    Ok(ExecutedCheckpointCapture {
+        exit_code: exit_code.raw(),
+        journal: captured_journal,
+        stdout: captured_stdout,
+        stderr: captured_stderr,
+    })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn create_capture_journal_file() -> std::result::Result<std::fs::File, String> {
+    let descriptor = rustix::fs::memfd_create(
+        "runtrue-wasix-capture-journal",
+        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|error| format!("cannot create capture journal memfd: {error}"))?;
+    Ok(std::fs::File::from(descriptor))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn bounded_wasix_worker_engine() -> wasmer::Engine {
+    use wasmer::{
+        Pages,
+        sys::{BaseTunables, NativeEngineExt as _},
+    };
+
+    let mut engine = wasmer::Engine::default();
+    let tunables = BaseTunables {
+        static_memory_bound: Pages(4_096),
+        static_memory_offset_guard_size: 64 * 1024,
+        dynamic_memory_offset_guard_size: 64 * 1024,
+    };
+    engine.set_tunables(tunables);
+    engine
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn inspect_captured_journal(
+    journal_file: &std::fs::File,
+    expected_module_hash: &[u8],
+) -> std::result::Result<u64, String> {
+    use wasmer_wasix::journal::{JournalEntry, LogFileJournal, ReadableJournal, SnapshotTrigger};
+
+    let inspection = LogFileJournal::from_file(
+        journal_file
+            .try_clone()
+            .map_err(|error| format!("cannot clone completed capture journal: {error}"))?,
+    )
+    .map_err(|error| format!("cannot inspect completed capture journal: {error}"))?;
+    let mut module_records = 0_u32;
+    let mut thread_records = 0_u32;
+    let mut explicit_snapshots = 0_u32;
+    let mut checkpoint_end = None;
+    while let Some(record) = inspection
+        .read()
+        .map_err(|error| format!("cannot decode completed capture journal: {error}"))?
+    {
+        match record.record {
+            JournalEntry::InitModuleV1 { wasm_hash } => {
+                if wasm_hash.as_ref() != expected_module_hash {
+                    return Err("capture journal module hash does not match the module".to_owned());
+                }
+                module_records = module_records.saturating_add(1);
+            }
+            JournalEntry::SetThreadV1 { .. } => {
+                thread_records = thread_records.saturating_add(1);
+            }
+            JournalEntry::SnapshotV1 {
+                trigger: SnapshotTrigger::Explicit,
+                ..
+            } => {
+                explicit_snapshots = explicit_snapshots.saturating_add(1);
+                checkpoint_end = Some(record.record_end);
+            }
+            _ => {}
+        }
+    }
+    if module_records != 1 || thread_records == 0 || explicit_snapshots != 1 {
+        return Err("capture journal is missing required explicit snapshot state".to_owned());
+    }
+    checkpoint_end.ok_or_else(|| "capture journal has no explicit snapshot boundary".to_owned())
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -2140,16 +3023,33 @@ fn write_worker_output_frame(
     writer: &mut impl Write,
     frame: &[u8],
 ) -> std::result::Result<(), String> {
-    if frame.len() > WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES {
-        return Err("restore output exceeds the protocol frame limit".to_owned());
+    write_worker_bounded_frame(
+        writer,
+        frame,
+        WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+        true,
+        "restore output",
+    )
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+fn write_worker_bounded_frame(
+    writer: &mut impl Write,
+    frame: &[u8],
+    maximum: usize,
+    allow_empty: bool,
+    label: &str,
+) -> std::result::Result<(), String> {
+    if (!allow_empty && frame.is_empty()) || frame.len() > maximum {
+        return Err(format!("{label} exceeds the protocol frame limit"));
     }
     let length = u32::try_from(frame.len())
-        .map_err(|_| "restore output exceeds the protocol frame limit".to_owned())?;
+        .map_err(|_| format!("{label} exceeds the protocol frame limit"))?;
     writer
         .write_all(&length.to_be_bytes())
         .and_then(|()| writer.write_all(frame))
         .and_then(|()| writer.flush())
-        .map_err(|error| format!("cannot write restore output: {error}"))
+        .map_err(|error| format!("cannot write {label}: {error}"))
 }
 
 #[cfg(test)]
@@ -2237,7 +3137,10 @@ mod tests {
         isolation.core_file_limits = [1; 2];
         incompatible.push(isolation);
         let mut isolation = compatible.clone();
-        isolation.file_size_limits = [WASIX_WORKER_MAX_FILE_BYTES - 1; 2];
+        isolation.file_size_limits = [WASIX_WORKER_MAX_FILE_BYTES + 1; 2];
+        incompatible.push(isolation);
+        let mut isolation = compatible.clone();
+        isolation.address_space_limits = [WASIX_WORKER_MAX_ADDRESS_SPACE_BYTES + 1; 2];
         incompatible.push(isolation);
         let mut isolation = compatible;
         isolation.open_file_limits = [65; 2];

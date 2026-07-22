@@ -41,12 +41,17 @@ pub use types::{
 };
 #[cfg(feature = "wasix-checkpoint")]
 #[doc(hidden)]
+pub use wasix_worker::write_wasix_checkpoint_capture;
+#[cfg(feature = "wasix-checkpoint")]
+#[doc(hidden)]
 pub use wasix_worker::write_wasix_checkpoint_restore;
 pub use wasix_worker::{
     WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixCheckpointTransportMetadata,
     WasixWorkerConfig, WasixWorkerIsolation, WasixWorkerMetadata, probe_wasix_checkpoint_transport,
     probe_wasix_worker,
 };
+#[cfg(feature = "wasix-checkpoint")]
+pub use wasix_worker::{WasixCheckpointCapture, capture_wasix_checkpoint};
 #[cfg(feature = "wasix-checkpoint")]
 pub use wasix_worker::{WasixCheckpointRestoreMetadata, restore_wasix_checkpoint};
 #[cfg(feature = "wasix")]
