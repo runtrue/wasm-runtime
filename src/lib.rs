@@ -13,6 +13,7 @@ mod http;
 mod measurement;
 mod runtime;
 mod types;
+mod wasix_worker;
 
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use config::{RuntimeConfig, RuntimeLimits};
@@ -30,6 +31,12 @@ pub use runtime::{Program, RunningCommand, Runtime, RuntimeBuilder, RuntimeMetri
 pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
     WasiProfile, WasiVersion,
+};
+#[doc(hidden)]
+pub use wasix_worker::write_wasix_worker_probe;
+pub use wasix_worker::{
+    WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixWorkerConfig, WasixWorkerMetadata,
+    probe_wasix_worker,
 };
 
 /// Exact Wasmtime release used to compile serialized artifacts.
