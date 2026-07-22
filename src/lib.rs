@@ -6,6 +6,7 @@
 //! component (warm) tiers. Every call receives a fresh Store and WASI context.
 
 mod cache;
+mod checkpoint;
 mod config;
 mod environment;
 mod error;
@@ -16,6 +17,10 @@ mod types;
 mod wasix_worker;
 
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
+pub use checkpoint::{
+    CapturedWasixJournal, CheckpointAuthenticationKey, VerifiedWasixCheckpoint,
+    WasixCheckpointBinding, WasixCheckpointCodec,
+};
 pub use config::{RuntimeConfig, RuntimeLimits};
 pub use environment::{
     EnvironmentArtifact, EnvironmentBuild, EnvironmentCommands, EnvironmentFilesystem,
