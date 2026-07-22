@@ -37,13 +37,14 @@ pub use types::{
     CancellationToken, CommandInput, CommandOutput, InvocationState, PackageTier, PauseToken,
     WasiProfile, WasiVersion,
 };
+pub use wasix_worker::{
+    WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixCheckpointTransportMetadata,
+    WasixWorkerConfig, WasixWorkerIsolation, WasixWorkerMetadata, probe_wasix_checkpoint_transport,
+    probe_wasix_worker,
+};
 #[cfg(feature = "wasix")]
 #[doc(hidden)]
-pub use wasix_worker::write_wasix_worker_probe;
-pub use wasix_worker::{
-    WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixWorkerConfig, WasixWorkerIsolation,
-    WasixWorkerMetadata, probe_wasix_worker,
-};
+pub use wasix_worker::{write_wasix_checkpoint_transport_probe, write_wasix_worker_probe};
 
 /// Exact Wasmtime release used to compile serialized artifacts.
 pub const WASMTIME_VERSION: &str = "46.0.1";

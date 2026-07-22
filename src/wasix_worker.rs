@@ -1,7 +1,18 @@
-use crate::{Error, Result};
+use crate::{Error, Result, VerifiedWasixCheckpoint, WasixCheckpointBinding};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "wasix")]
+#[cfg(target_os = "linux")]
+use sha2::{Digest as _, Sha256};
+#[cfg(all(feature = "wasix", not(target_os = "linux")))]
+use std::io::Read;
+#[cfg(any(feature = "wasix", target_os = "linux"))]
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -15,7 +26,7 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 2;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 3;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
@@ -25,12 +36,18 @@ const WASIX_WORKER_MAX_OPEN_FILES: u64 = 64;
 const WASIX_WORKER_MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const WASIX_WORKER_MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::SEAL
+    .union(rustix::fs::SealFlags::SHRINK)
+    .union(rustix::fs::SealFlags::GROW)
+    .union(rustix::fs::SealFlags::WRITE);
 
 /// Explicit deployment configuration for the out-of-process WASIX worker.
 ///
 /// The executable is a deployment trust anchor and must be installed at a
 /// trusted, administrator-controlled path. The protocol probe checks reported
-/// compatibility; it is not a signature over the executable. Version 2 of the
+/// compatibility; it is not a signature over the executable. Version 3 of the
 /// worker process boundary is supported on Linux only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasixWorkerConfig {
@@ -50,7 +67,10 @@ impl WasixWorkerConfig {
         }
     }
 
-    /// Set the maximum time allowed for the complete deployment probe.
+    /// Set the maximum time allowed for a complete probe or transport.
+    ///
+    /// Checkpoint transport applies this deadline to memfd preparation plus
+    /// the complete Ready, acknowledgement, EOF, and worker-exit exchange.
     #[must_use]
     pub const fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
@@ -189,6 +209,37 @@ impl WasixWorkerMetadata {
             )));
         }
         self.isolation.validate(allowed_groups)?;
+        Ok(())
+    }
+}
+
+/// Result of transporting one verified checkpoint into a fresh isolated worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasixCheckpointTransportMetadata {
+    /// Compatibility and isolation state reported before checkpoint input was read.
+    pub worker: WasixWorkerMetadata,
+    /// Authenticated workload and generation bound to the transported journal.
+    pub binding: WasixCheckpointBinding,
+    /// Exact number of immutable journal bytes accepted by the worker.
+    pub journal_bytes: u64,
+    /// Lowercase SHA-256 digest independently computed by the worker.
+    pub journal_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointTransportAck {
+    journal_bytes: u64,
+    journal_sha256: String,
+}
+
+impl WasixCheckpointTransportAck {
+    fn validate(&self, expected_bytes: u64, expected_sha256: &str) -> Result<()> {
+        if self.journal_bytes != expected_bytes || self.journal_sha256 != expected_sha256 {
+            return Err(Error::Execution(
+                "WASIX worker checkpoint acknowledgement did not match the sealed input".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -344,6 +395,391 @@ pub async fn probe_wasix_worker(config: &WasixWorkerConfig) -> Result<WasixWorke
     ProbeSupervisor::new(supervisor, cancel).wait().await
 }
 
+/// Transport authenticated checkpoint journal bytes into a fresh isolated worker.
+///
+/// The journal is copied into an anonymous file and sealed against writes and
+/// resizing. The child initially receives only a Unix control socket. After
+/// the parent validates the isolated worker's Ready frame, it transfers the
+/// sealed descriptor with `SCM_RIGHTS`; the worker validates its seals and size
+/// before streaming the bytes into SHA-256. This operation deliberately
+/// performs no Wasmer journal deserialization.
+///
+/// # Errors
+///
+/// Returns an error for invalid deployment configuration, an empty or
+/// oversized journal, memfd or seal failures, timeout, cancellation, malformed
+/// worker frames, or a digest/length mismatch.
+pub async fn probe_wasix_checkpoint_transport(
+    config: &WasixWorkerConfig,
+    checkpoint: VerifiedWasixCheckpoint,
+) -> Result<WasixCheckpointTransportMetadata> {
+    config.validate()?;
+    #[cfg(target_os = "linux")]
+    {
+        probe_wasix_checkpoint_transport_linux(config, checkpoint).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = checkpoint;
+        Err(Error::Configuration(
+            "the WASIX checkpoint transport currently requires Linux".to_owned(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_wasix_checkpoint_transport_linux(
+    config: &WasixWorkerConfig,
+    checkpoint: VerifiedWasixCheckpoint,
+) -> Result<WasixCheckpointTransportMetadata> {
+    let binding = checkpoint.binding().clone();
+    let journal = checkpoint.into_journal();
+    if journal.is_empty() || journal.len() > WASIX_WORKER_MAX_CHECKPOINT_BYTES {
+        return Err(Error::Checkpoint(
+            "verified checkpoint journal exceeds the worker transport limit".to_owned(),
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+    let prepared = CheckpointPreparation::new(journal)
+        .wait(config.handshake_timeout)
+        .await?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout);
+    }
+    let (control, child_control) = checkpoint_control_channel()?;
+
+    let mut command = Command::new(&config.executable);
+    command
+        .arg("--checkpoint-transport-probe")
+        .env_clear()
+        .current_dir("/")
+        .stdin(child_control)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().map_err(|error| {
+        Error::Execution(format!(
+            "failed to spawn WASIX worker {}: {error}",
+            config.executable.display()
+        ))
+    })?;
+    drop(command);
+    let mut worker = WorkerProcess::new(child)?;
+    let stdout = worker
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Execution("WASIX worker stdout was not piped".to_owned()))?;
+    let (cancel, cancelled) = oneshot::channel();
+    let expected = ExpectedCheckpointTransport {
+        binding,
+        journal_bytes: prepared.journal_bytes,
+        journal_sha256: prepared.journal_sha256,
+    };
+    let input = CheckpointTransportInput {
+        control: Some(control),
+        file: Some(prepared.file),
+        expected,
+    };
+    let supervisor = tokio::spawn(supervise_checkpoint_transport(
+        worker,
+        stdout,
+        remaining,
+        config.allowed_supplementary_groups.clone(),
+        input,
+        cancelled,
+    ));
+    CheckpointTransportSupervisor::new(supervisor, cancel)
+        .wait()
+        .await
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_checkpoint_input(
+    journal: Vec<u8>,
+    cancelled: &AtomicBool,
+) -> Result<PreparedCheckpointInput> {
+    use rustix::fs::{FileType, MemfdFlags, fcntl_add_seals, fcntl_get_seals, fstat, memfd_create};
+
+    let journal_bytes = u64::try_from(journal.len())
+        .map_err(|_| Error::Checkpoint("checkpoint journal length overflows u64".to_owned()))?;
+    let descriptor = memfd_create(
+        "runtrue-wasix-checkpoint",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|error| Error::Execution(format!("failed to create checkpoint memfd: {error}")))?;
+    let mut file = std::fs::File::from(descriptor);
+    let mut hash = Sha256::new();
+    for chunk in journal.chunks(64 * 1024) {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        hash.update(chunk);
+        file.write_all(chunk).map_err(|error| {
+            Error::Execution(format!("failed to fill checkpoint memfd: {error}"))
+        })?;
+    }
+    drop(journal);
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    let journal_sha256 = hex::encode(hash.finalize());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| Error::Execution(format!("failed to rewind checkpoint memfd: {error}")))?;
+    fcntl_add_seals(&file, REQUIRED_CHECKPOINT_SEALS)
+        .map_err(|error| Error::Execution(format!("failed to seal checkpoint memfd: {error}")))?;
+    let installed = fcntl_get_seals(&file).map_err(|error| {
+        Error::Execution(format!("failed to verify checkpoint memfd seals: {error}"))
+    })?;
+    if !installed.contains(REQUIRED_CHECKPOINT_SEALS) {
+        return Err(Error::Execution(
+            "checkpoint memfd is not fully sealed".to_owned(),
+        ));
+    }
+    let stat = fstat(&file).map_err(|error| {
+        Error::Execution(format!("failed to inspect checkpoint memfd: {error}"))
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 0
+        || u64::try_from(stat.st_size).ok() != Some(journal_bytes)
+    {
+        return Err(Error::Execution(
+            "checkpoint memfd identity is invalid".to_owned(),
+        ));
+    }
+    Ok(PreparedCheckpointInput {
+        file,
+        journal_bytes,
+        journal_sha256,
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedCheckpointInput {
+    file: std::fs::File,
+    journal_bytes: u64,
+    journal_sha256: String,
+}
+
+#[cfg(target_os = "linux")]
+struct CheckpointPreparation {
+    task: tokio::task::JoinHandle<Result<PreparedCheckpointInput>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl CheckpointPreparation {
+    fn new(journal: Vec<u8>) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let task = tokio::task::spawn_blocking(move || {
+            sealed_checkpoint_input(journal, task_cancelled.as_ref())
+        });
+        Self { task, cancelled }
+    }
+
+    async fn wait(mut self, timeout: Duration) -> Result<PreparedCheckpointInput> {
+        if let Ok(result) = tokio::time::timeout(timeout, &mut self.task).await {
+            result.map_err(|error| {
+                Error::Execution(format!(
+                    "checkpoint memfd preparation failed to join: {error}"
+                ))
+            })?
+        } else {
+            self.cancelled.store(true, Ordering::Relaxed);
+            let _ = (&mut self.task).await;
+            Err(Error::Timeout)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CheckpointPreparation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ExpectedCheckpointTransport {
+    binding: WasixCheckpointBinding,
+    journal_bytes: u64,
+    journal_sha256: String,
+}
+
+#[cfg(target_os = "linux")]
+struct CheckpointTransportInput {
+    control: Option<tokio::net::UnixStream>,
+    file: Option<std::fs::File>,
+    expected: ExpectedCheckpointTransport,
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_control_channel() -> Result<(tokio::net::UnixStream, Stdio)> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+
+    let (parent, child) = socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| {
+        Error::Execution(format!(
+            "failed to create checkpoint descriptor channel: {error}"
+        ))
+    })?;
+    let parent = std::os::unix::net::UnixStream::from(parent);
+    parent.set_nonblocking(true).map_err(|error| {
+        Error::Execution(format!(
+            "failed to configure checkpoint descriptor channel: {error}"
+        ))
+    })?;
+    let parent = tokio::net::UnixStream::from_std(parent).map_err(|error| {
+        Error::Execution(format!(
+            "failed to register checkpoint descriptor channel: {error}"
+        ))
+    })?;
+    Ok((parent, Stdio::from(std::fs::File::from(child))))
+}
+
+#[cfg(target_os = "linux")]
+async fn send_checkpoint_descriptor(
+    control: &tokio::net::UnixStream,
+    checkpoint: &std::fs::File,
+) -> Result<()> {
+    loop {
+        control.writable().await.map_err(|error| {
+            Error::Execution(format!(
+                "checkpoint descriptor channel was not writable: {error}"
+            ))
+        })?;
+        match control.try_io(tokio::io::Interest::WRITABLE, || {
+            send_checkpoint_descriptor_once(control, checkpoint)
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                return Err(Error::Execution(format!(
+                    "failed to send checkpoint descriptor: {error}"
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_checkpoint_descriptor_once(
+    control: &tokio::net::UnixStream,
+    checkpoint: &std::fs::File,
+) -> std::io::Result<()> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    use std::{io::IoSlice, mem::MaybeUninit, os::fd::AsFd as _};
+
+    let descriptors = [checkpoint.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(std::io::Error::other(
+            "checkpoint descriptor ancillary buffer is too small",
+        ));
+    }
+    let marker = [b'C'];
+    let sent = sendmsg(
+        control,
+        &[IoSlice::new(&marker)],
+        &mut ancillary,
+        SendFlags::NOSIGNAL,
+    )
+    .map_err(std::io::Error::from)?;
+    if sent != marker.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "checkpoint descriptor marker was not sent",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn supervise_checkpoint_transport(
+    mut worker: WorkerProcess,
+    mut stdout: tokio::process::ChildStdout,
+    handshake_timeout: Duration,
+    allowed_supplementary_groups: Vec<u32>,
+    mut input: CheckpointTransportInput,
+    mut cancelled: oneshot::Receiver<()>,
+) -> Result<WasixCheckpointTransportMetadata> {
+    let process_id = worker.process_id;
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut cancelled => Err(Error::Cancelled),
+        result = tokio::time::timeout(
+            handshake_timeout,
+            perform_checkpoint_transport(
+                &mut worker,
+                &mut stdout,
+                process_id,
+                &allowed_supplementary_groups,
+                &mut input,
+            ),
+        ) => match result {
+            Ok(result) => result,
+            Err(_) => Err(Error::Timeout),
+        },
+    };
+
+    if outcome.is_err() && worker.active {
+        drop(stdout);
+        spawn_worker_reaper(worker);
+    }
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+async fn perform_checkpoint_transport(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+    process_id: u32,
+    allowed_supplementary_groups: &[u32],
+    input: &mut CheckpointTransportInput,
+) -> Result<WasixCheckpointTransportMetadata> {
+    let ready = read_frame(stdout).await?;
+    let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready)
+        .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
+    metadata.validate(process_id, allowed_supplementary_groups)?;
+
+    let control = input
+        .control
+        .as_ref()
+        .ok_or_else(|| Error::Execution("checkpoint control socket is unavailable".to_owned()))?;
+    let file = input
+        .file
+        .as_ref()
+        .ok_or_else(|| Error::Execution("sealed checkpoint input is unavailable".to_owned()))?;
+    send_checkpoint_descriptor(control, file).await?;
+    input.control.take();
+    input.file.take();
+
+    let frame = read_frame(stdout).await?;
+    let acknowledgement: WasixCheckpointTransportAck =
+        serde_json::from_slice(&frame).map_err(|error| {
+            Error::Execution(format!("invalid WASIX checkpoint acknowledgement: {error}"))
+        })?;
+    acknowledgement.validate(input.expected.journal_bytes, &input.expected.journal_sha256)?;
+    finish_worker_output(worker, stdout, "checkpoint transport").await?;
+    Ok(WasixCheckpointTransportMetadata {
+        worker: metadata,
+        binding: input.expected.binding.clone(),
+        journal_bytes: acknowledgement.journal_bytes,
+        journal_sha256: acknowledgement.journal_sha256,
+    })
+}
+
 async fn supervise_probe(
     mut worker: WorkerProcess,
     mut stdout: tokio::process::ChildStdout,
@@ -387,26 +823,39 @@ async fn perform_handshake(
         .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
     metadata.validate(process_id, allowed_supplementary_groups)?;
 
+    finish_worker_output(worker, stdout, "probe").await?;
+    Ok(metadata)
+}
+
+async fn finish_worker_output(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+    operation: &str,
+) -> Result<()> {
     let mut trailing = [0_u8; 1];
     if stdout.read(&mut trailing).await.map_err(|error| {
-        Error::Execution(format!("failed to finish WASIX worker handshake: {error}"))
+        Error::Execution(format!(
+            "failed to finish WASIX worker {operation}: {error}"
+        ))
     })? != 0
     {
-        return Err(Error::Execution(
-            "WASIX worker emitted trailing handshake bytes".to_owned(),
-        ));
+        return Err(Error::Execution(format!(
+            "WASIX worker emitted trailing {operation} bytes"
+        )));
     }
     let status = worker.child.wait().await.map_err(|error| {
-        Error::Execution(format!("failed to wait for WASIX worker probe: {error}"))
+        Error::Execution(format!(
+            "failed to wait for WASIX worker {operation}: {error}"
+        ))
     })?;
     worker.kill_tree();
     worker.disarm();
     if !status.success() {
         return Err(Error::Execution(format!(
-            "WASIX worker probe exited with {status}"
+            "WASIX worker {operation} exited with {status}"
         )));
     }
-    Ok(metadata)
+    Ok(())
 }
 
 struct ProbeSupervisor {
@@ -435,6 +884,41 @@ impl ProbeSupervisor {
 }
 
 impl Drop for ProbeSupervisor {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+struct CheckpointTransportSupervisor {
+    task: tokio::task::JoinHandle<Result<WasixCheckpointTransportMetadata>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl CheckpointTransportSupervisor {
+    const fn new(
+        task: tokio::task::JoinHandle<Result<WasixCheckpointTransportMetadata>>,
+        cancel: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            task,
+            cancel: Some(cancel),
+        }
+    }
+
+    async fn wait(mut self) -> Result<WasixCheckpointTransportMetadata> {
+        let outcome = (&mut self.task).await.map_err(|error| {
+            Error::Execution(format!(
+                "WASIX checkpoint transport supervisor failed: {error}"
+            ))
+        })?;
+        self.cancel.take();
+        outcome
+    }
+}
+
+impl Drop for CheckpointTransportSupervisor {
     fn drop(&mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
@@ -753,7 +1237,7 @@ fn lower_worker_limit(
     Ok([current, hard])
 }
 
-/// Enter the worker isolation profile and write one version 2 ready frame.
+/// Enter the worker isolation profile and write one version 3 ready frame.
 ///
 /// This function must be called from the worker's initial thread before a
 /// Tokio runtime is created and before any guest-controlled bytes are read.
@@ -763,6 +1247,143 @@ pub fn write_wasix_worker_probe(mut writer: impl Write) -> std::result::Result<(
     let isolation = enter_wasix_worker_isolation()?;
     let frame = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
         .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    write_worker_frame(&mut writer, &frame)
+}
+
+/// Enter isolation, receive a sealed descriptor, and acknowledge its exact digest.
+///
+/// This transport probe never deserializes Wasmer journal records. It must run
+/// on the worker's initial thread before any runtime threads are created.
+#[doc(hidden)]
+#[cfg(all(feature = "wasix", target_os = "linux"))]
+pub fn write_wasix_checkpoint_transport_probe(
+    reader: impl std::os::fd::AsFd,
+    mut writer: impl Write,
+) -> std::result::Result<(), String> {
+    use rustix::fs::{FileType, Mode, OFlags, fcntl_get_seals, fstat, open};
+
+    let isolation = enter_wasix_worker_isolation()?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
+        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    write_worker_frame(&mut writer, &ready)?;
+
+    let checkpoint = receive_checkpoint_descriptor(&reader)?;
+    let installed = fcntl_get_seals(&checkpoint)
+        .map_err(|error| format!("checkpoint descriptor does not expose seals: {error}"))?;
+    if !installed.contains(REQUIRED_CHECKPOINT_SEALS) {
+        return Err("checkpoint descriptor is not fully sealed".to_owned());
+    }
+    let stat = fstat(&checkpoint)
+        .map_err(|error| format!("cannot inspect sealed checkpoint descriptor: {error}"))?;
+    let journal_bytes = u64::try_from(stat.st_size)
+        .map_err(|_| "checkpoint descriptor size is negative".to_owned())?;
+    let maximum_checkpoint_bytes = u64::try_from(WASIX_WORKER_MAX_CHECKPOINT_BYTES)
+        .map_err(|_| "worker checkpoint limit overflows u64".to_owned())?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 0
+        || journal_bytes == 0
+        || journal_bytes > maximum_checkpoint_bytes
+    {
+        return Err("checkpoint descriptor identity or size is invalid".to_owned());
+    }
+
+    let mut hash = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while offset < journal_bytes {
+        let buffer_bytes = u64::try_from(buffer.len())
+            .map_err(|_| "checkpoint read buffer length overflows u64".to_owned())?;
+        let remaining = usize::try_from((journal_bytes - offset).min(buffer_bytes))
+            .map_err(|_| "checkpoint read length overflows usize".to_owned())?;
+        let read = rustix::io::pread(&checkpoint, &mut buffer[..remaining], offset)
+            .map_err(|error| format!("cannot read sealed checkpoint descriptor: {error}"))?;
+        if read == 0 {
+            return Err("sealed checkpoint descriptor ended prematurely".to_owned());
+        }
+        hash.update(&buffer[..read]);
+        offset = offset
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| "checkpoint read length overflows u64".to_owned())?,
+            )
+            .ok_or_else(|| "checkpoint read offset overflowed".to_owned())?;
+    }
+    let mut trailing = [0_u8; 1];
+    if rustix::io::pread(&checkpoint, &mut trailing, journal_bytes)
+        .map_err(|error| format!("cannot finish sealed checkpoint descriptor: {error}"))?
+        != 0
+    {
+        return Err("sealed checkpoint descriptor contains trailing bytes".to_owned());
+    }
+
+    let null = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|error| format!("cannot open null input for checkpoint worker: {error}"))?;
+    rustix::stdio::dup2_stdin(&null)
+        .map_err(|error| format!("cannot clear checkpoint worker stdin: {error}"))?;
+    drop(reader);
+
+    let acknowledgement = WasixCheckpointTransportAck {
+        journal_bytes,
+        journal_sha256: hex::encode(hash.finalize()),
+    };
+    let frame = serde_json::to_vec(&acknowledgement)
+        .map_err(|error| format!("cannot encode checkpoint acknowledgement: {error}"))?;
+    write_worker_frame(&mut writer, &frame)
+}
+
+#[cfg(all(feature = "wasix", target_os = "linux"))]
+fn receive_checkpoint_descriptor(
+    control: &impl std::os::fd::AsFd,
+) -> std::result::Result<std::os::fd::OwnedFd, String> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, recvmsg};
+    use std::{io::IoSliceMut, mem::MaybeUninit};
+
+    let mut marker = [0_u8; 1];
+    let mut payload = [IoSliceMut::new(&mut marker)];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+    let message = recvmsg(
+        control,
+        &mut payload,
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    )
+    .map_err(|error| format!("cannot receive checkpoint descriptor: {error}"))?;
+    if message.bytes != 1
+        || marker != [b'C']
+        || message
+            .flags
+            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
+    {
+        return Err("checkpoint descriptor message is malformed".to_owned());
+    }
+
+    let mut checkpoint = None;
+    for message in ancillary.drain() {
+        let RecvAncillaryMessage::ScmRights(mut descriptors) = message else {
+            return Err("checkpoint descriptor message has unexpected metadata".to_owned());
+        };
+        let descriptor = descriptors
+            .next()
+            .ok_or_else(|| "checkpoint descriptor message is empty".to_owned())?;
+        if checkpoint.replace(descriptor).is_some() || descriptors.next().is_some() {
+            return Err("checkpoint descriptor message contains multiple files".to_owned());
+        }
+    }
+    checkpoint.ok_or_else(|| "checkpoint descriptor message did not contain a file".to_owned())
+}
+
+#[doc(hidden)]
+#[cfg(all(feature = "wasix", not(target_os = "linux")))]
+pub fn write_wasix_checkpoint_transport_probe(
+    _reader: impl Read,
+    _writer: impl Write,
+) -> std::result::Result<(), String> {
+    Err("the WASIX checkpoint transport requires Linux".to_owned())
+}
+
+#[cfg(feature = "wasix")]
+fn write_worker_frame(writer: &mut impl Write, frame: &[u8]) -> std::result::Result<(), String> {
     if frame.len() > MAX_HANDSHAKE_BYTES {
         return Err("worker metadata exceeds the protocol frame limit".to_owned());
     }
@@ -770,7 +1391,7 @@ pub fn write_wasix_worker_probe(mut writer: impl Write) -> std::result::Result<(
         .map_err(|_| "worker metadata exceeds the protocol frame limit".to_owned())?;
     writer
         .write_all(&length.to_be_bytes())
-        .and_then(|()| writer.write_all(&frame))
+        .and_then(|()| writer.write_all(frame))
         .and_then(|()| writer.flush())
         .map_err(|error| format!("cannot write worker metadata: {error}"))
 }
@@ -779,6 +1400,16 @@ pub fn write_wasix_worker_probe(mut writer: impl Write) -> std::result::Result<(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelled_checkpoint_preparation_stops_before_transport() {
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            sealed_checkpoint_input(vec![1_u8; 64 * 1024], &cancelled),
+            Err(Error::Cancelled)
+        ));
+    }
 
     #[test]
     fn rejects_each_worker_compatibility_mismatch() {

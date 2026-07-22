@@ -419,6 +419,10 @@ impl VerifiedWasixCheckpoint {
     pub fn artifact_sha256(&self) -> &str {
         &self.artifact_sha256
     }
+
+    pub(crate) fn into_journal(self) -> Vec<u8> {
+        self.journal
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
