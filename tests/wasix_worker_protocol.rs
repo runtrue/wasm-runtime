@@ -59,7 +59,10 @@ async fn transports_verified_journal_through_sealed_stdin() {
     assert_eq!(metadata.binding, expected_binding);
     assert_eq!(metadata.journal_bytes, expected_bytes);
     assert_eq!(metadata.journal_sha256, expected_sha256);
-    assert_eq!(metadata.worker.protocol_version, 3);
+    assert_eq!(
+        metadata.worker.protocol_version,
+        WASIX_WORKER_PROTOCOL_VERSION
+    );
     assert_ne!(metadata.worker.process_id, std::process::id());
     assert!(metadata.worker.isolation.no_new_privileges);
     assert_eq!(metadata.worker.isolation.capability_masks, [0; 4]);
@@ -405,7 +408,7 @@ async fn assert_transport_rejected(input: std::fs::File) {
     let ready = read_test_frame(&mut stdout).await;
     let metadata: runtrue_wasm_runtime::WasixWorkerMetadata =
         serde_json::from_slice(&ready).unwrap();
-    assert_eq!(metadata.protocol_version, 3);
+    assert_eq!(metadata.protocol_version, WASIX_WORKER_PROTOCOL_VERSION);
     send_checkpoint_descriptor(&control, &input);
     assert!(read_test_frame_result(&mut stdout).await.is_err());
     assert!(!child.wait().await.unwrap().success());

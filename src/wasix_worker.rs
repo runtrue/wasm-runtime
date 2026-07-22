@@ -26,7 +26,7 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 3;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 4;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
@@ -37,6 +37,10 @@ const WASIX_WORKER_MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const WASIX_WORKER_MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::SEAL
     .union(rustix::fs::SealFlags::SHRINK)
@@ -47,7 +51,7 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 ///
 /// The executable is a deployment trust anchor and must be installed at a
 /// trusted, administrator-controlled path. The protocol probe checks reported
-/// compatibility; it is not a signature over the executable. Version 3 of the
+/// compatibility; it is not a signature over the executable. Version 4 of the
 /// worker process boundary is supported on Linux only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasixWorkerConfig {
@@ -67,7 +71,7 @@ impl WasixWorkerConfig {
         }
     }
 
-    /// Set the maximum time allowed for a complete probe or transport.
+    /// Set the maximum time allowed for a complete probe, transport, or restore.
     ///
     /// Checkpoint transport applies this deadline to memfd preparation plus
     /// the complete Ready, acknowledgement, EOF, and worker-exit exchange.
@@ -226,6 +230,22 @@ pub struct WasixCheckpointTransportMetadata {
     pub journal_sha256: String,
 }
 
+/// Result of restoring an authenticated checkpoint in a fresh isolated worker.
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasixCheckpointRestoreMetadata {
+    /// Compatibility and isolation state of the destination worker.
+    pub worker: WasixWorkerMetadata,
+    /// Authenticated workload and generation restored by the worker.
+    pub binding: WasixCheckpointBinding,
+    /// Bounded standard output emitted after the checkpoint resumed.
+    pub stdout: Vec<u8>,
+    /// Lowercase SHA-256 digest of the restored module.
+    pub module_sha256: String,
+    /// Lowercase SHA-256 digest of the restored journal.
+    pub journal_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WasixCheckpointTransportAck {
@@ -233,11 +253,70 @@ struct WasixCheckpointTransportAck {
     journal_sha256: String,
 }
 
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointRestoreAck {
+    module_bytes: u64,
+    module_sha256: String,
+    journal_bytes: u64,
+    journal_sha256: String,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WasixCheckpointRestoreCompletion {
+    exit_code: i32,
+    stdout_bytes: u64,
+    stdout_sha256: String,
+}
+
 impl WasixCheckpointTransportAck {
     fn validate(&self, expected_bytes: u64, expected_sha256: &str) -> Result<()> {
         if self.journal_bytes != expected_bytes || self.journal_sha256 != expected_sha256 {
             return Err(Error::Execution(
                 "WASIX worker checkpoint acknowledgement did not match the sealed input".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl WasixCheckpointRestoreAck {
+    fn validate(
+        &self,
+        module_bytes: u64,
+        module_sha256: &str,
+        journal_bytes: u64,
+        journal_sha256: &str,
+    ) -> Result<()> {
+        if self.module_bytes != module_bytes
+            || self.module_sha256 != module_sha256
+            || self.journal_bytes != journal_bytes
+            || self.journal_sha256 != journal_sha256
+        {
+            return Err(Error::Execution(
+                "WASIX worker restore acknowledgement did not match the sealed inputs".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl WasixCheckpointRestoreCompletion {
+    fn validate(&self, stdout: &[u8]) -> Result<()> {
+        let stdout_bytes = u64::try_from(stdout.len())
+            .map_err(|_| Error::Execution("WASIX worker output length overflows u64".to_owned()))?;
+        let stdout_sha256 = hex::encode(Sha256::digest(stdout));
+        if self.exit_code != 0
+            || self.stdout_bytes != stdout_bytes
+            || self.stdout_sha256 != stdout_sha256
+        {
+            return Err(Error::Execution(
+                "WASIX worker restore completion did not match its output".to_owned(),
             ));
         }
         Ok(())
@@ -427,6 +506,134 @@ pub async fn probe_wasix_checkpoint_transport(
     }
 }
 
+/// Restore an authenticated WASIX checkpoint in a fresh isolated worker.
+///
+/// The destination receives the exact module and journal as fully sealed
+/// anonymous files. It independently checks both digests and acknowledges
+/// them before the parent authorizes execution. Destination arguments are
+/// deliberately absent: process state, including the source arguments, is
+/// recovered only from the authenticated journal.
+///
+/// # Errors
+///
+/// Returns an error for an incompatible binding, invalid deployment, input
+/// preparation failure, timeout, worker protocol violation, restore failure,
+/// or output beyond the fixed capture limit.
+#[cfg(feature = "wasix-checkpoint")]
+pub async fn restore_wasix_checkpoint(
+    config: &WasixWorkerConfig,
+    checkpoint: VerifiedWasixCheckpoint,
+    module: Vec<u8>,
+) -> Result<WasixCheckpointRestoreMetadata> {
+    config.validate()?;
+    #[cfg(target_os = "linux")]
+    {
+        restore_wasix_checkpoint_linux(config, checkpoint, module).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (checkpoint, module);
+        Err(Error::Configuration(
+            "WASIX checkpoint restore currently requires Linux".to_owned(),
+        ))
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn restore_wasix_checkpoint_linux(
+    config: &WasixWorkerConfig,
+    checkpoint: VerifiedWasixCheckpoint,
+    module: Vec<u8>,
+) -> Result<WasixCheckpointRestoreMetadata> {
+    let binding = checkpoint.binding().clone();
+    if binding.command() != "_start" {
+        return Err(Error::UnsupportedComponent(format!(
+            "WASIX checkpoint command {:?} cannot be restored; only \"_start\" is supported",
+            binding.command()
+        )));
+    }
+    if module.is_empty() || module.len() > WASIX_WORKER_MAX_MODULE_BYTES {
+        return Err(Error::Checkpoint(
+            "WASIX restore module exceeds the worker input limit".to_owned(),
+        ));
+    }
+    let journal = checkpoint.into_journal();
+    if journal.is_empty() || journal.len() > WASIX_WORKER_MAX_CHECKPOINT_BYTES {
+        return Err(Error::Checkpoint(
+            "verified checkpoint journal exceeds the worker restore limit".to_owned(),
+        ));
+    }
+
+    let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+    let prepared_module = ModulePreparation::new(module)
+        .wait(config.handshake_timeout)
+        .await?;
+    if prepared_module.sha256 != binding.module_sha256() {
+        return Err(Error::Checkpoint(
+            "WASIX restore module does not match the authenticated checkpoint binding".to_owned(),
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout);
+    }
+    let prepared_checkpoint = CheckpointPreparation::new(journal).wait(remaining).await?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout);
+    }
+
+    let (control, child_control) = checkpoint_control_channel()?;
+    let mut command = Command::new(&config.executable);
+    command
+        .arg("--checkpoint-restore")
+        .env_clear()
+        .current_dir("/")
+        .stdin(child_control)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().map_err(|error| {
+        Error::Execution(format!(
+            "failed to spawn WASIX restore worker {}: {error}",
+            config.executable.display()
+        ))
+    })?;
+    drop(command);
+    let mut worker = WorkerProcess::new(child)?;
+    let stdout =
+        worker.child.stdout.take().ok_or_else(|| {
+            Error::Execution("WASIX restore worker stdout was not piped".to_owned())
+        })?;
+    let expected = ExpectedCheckpointRestore {
+        binding,
+        module_bytes: prepared_module.bytes,
+        module_sha256: prepared_module.sha256,
+        journal_bytes: prepared_checkpoint.journal_bytes,
+        journal_sha256: prepared_checkpoint.journal_sha256,
+    };
+    let input = CheckpointRestoreInput {
+        control: Some(control),
+        module: Some(prepared_module.file),
+        journal: Some(prepared_checkpoint.file),
+        expected,
+    };
+    let (cancel, cancelled) = oneshot::channel();
+    let supervisor = tokio::spawn(supervise_checkpoint_restore(
+        worker,
+        stdout,
+        remaining,
+        config.allowed_supplementary_groups.clone(),
+        input,
+        cancelled,
+    ));
+    CheckpointRestoreSupervisor::new(supervisor, cancel)
+        .wait()
+        .await
+}
+
 #[cfg(target_os = "linux")]
 async fn probe_wasix_checkpoint_transport_linux(
     config: &WasixWorkerConfig,
@@ -564,6 +771,102 @@ struct PreparedCheckpointInput {
     journal_sha256: String,
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct PreparedModuleInput {
+    file: std::fs::File,
+    bytes: u64,
+    sha256: String,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn sealed_module_input(module: Vec<u8>, cancelled: &AtomicBool) -> Result<PreparedModuleInput> {
+    use rustix::fs::{FileType, MemfdFlags, fcntl_add_seals, fcntl_get_seals, fstat, memfd_create};
+
+    let bytes = u64::try_from(module.len())
+        .map_err(|_| Error::Checkpoint("WASIX module length overflows u64".to_owned()))?;
+    let descriptor = memfd_create(
+        "runtrue-wasix-module",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|error| Error::Execution(format!("failed to create module memfd: {error}")))?;
+    let mut file = std::fs::File::from(descriptor);
+    let mut hash = Sha256::new();
+    for chunk in module.chunks(64 * 1024) {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        hash.update(chunk);
+        file.write_all(chunk)
+            .map_err(|error| Error::Execution(format!("failed to fill module memfd: {error}")))?;
+    }
+    drop(module);
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    let sha256 = hex::encode(hash.finalize());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| Error::Execution(format!("failed to rewind module memfd: {error}")))?;
+    fcntl_add_seals(&file, REQUIRED_CHECKPOINT_SEALS)
+        .map_err(|error| Error::Execution(format!("failed to seal module memfd: {error}")))?;
+    let installed = fcntl_get_seals(&file).map_err(|error| {
+        Error::Execution(format!("failed to verify module memfd seals: {error}"))
+    })?;
+    let stat = fstat(&file)
+        .map_err(|error| Error::Execution(format!("failed to inspect module memfd: {error}")))?;
+    if !installed.contains(REQUIRED_CHECKPOINT_SEALS)
+        || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 0
+        || u64::try_from(stat.st_size).ok() != Some(bytes)
+    {
+        return Err(Error::Execution(
+            "module memfd identity is invalid".to_owned(),
+        ));
+    }
+    Ok(PreparedModuleInput {
+        file,
+        bytes,
+        sha256,
+    })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct ModulePreparation {
+    task: tokio::task::JoinHandle<Result<PreparedModuleInput>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl ModulePreparation {
+    fn new(module: Vec<u8>) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = Arc::clone(&cancelled);
+        let task = tokio::task::spawn_blocking(move || {
+            sealed_module_input(module, task_cancelled.as_ref())
+        });
+        Self { task, cancelled }
+    }
+
+    async fn wait(mut self, timeout: Duration) -> Result<PreparedModuleInput> {
+        if let Ok(result) = tokio::time::timeout(timeout, &mut self.task).await {
+            result.map_err(|error| {
+                Error::Execution(format!("module memfd preparation failed to join: {error}"))
+            })?
+        } else {
+            self.cancelled.store(true, Ordering::Relaxed);
+            let _ = (&mut self.task).await;
+            Err(Error::Timeout)
+        }
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl Drop for ModulePreparation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct CheckpointPreparation {
     task: tokio::task::JoinHandle<Result<PreparedCheckpointInput>>,
@@ -618,6 +921,23 @@ struct CheckpointTransportInput {
     expected: ExpectedCheckpointTransport,
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct ExpectedCheckpointRestore {
+    binding: WasixCheckpointBinding,
+    module_bytes: u64,
+    module_sha256: String,
+    journal_bytes: u64,
+    journal_sha256: String,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CheckpointRestoreInput {
+    control: Option<tokio::net::UnixStream>,
+    module: Option<std::fs::File>,
+    journal: Option<std::fs::File>,
+    expected: ExpectedCheckpointRestore,
+}
+
 #[cfg(target_os = "linux")]
 fn checkpoint_control_channel() -> Result<(tokio::net::UnixStream, Stdio)> {
     use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -651,6 +971,7 @@ fn checkpoint_control_channel() -> Result<(tokio::net::UnixStream, Stdio)> {
 async fn send_checkpoint_descriptor(
     control: &tokio::net::UnixStream,
     checkpoint: &std::fs::File,
+    marker: u8,
 ) -> Result<()> {
     loop {
         control.writable().await.map_err(|error| {
@@ -659,7 +980,7 @@ async fn send_checkpoint_descriptor(
             ))
         })?;
         match control.try_io(tokio::io::Interest::WRITABLE, || {
-            send_checkpoint_descriptor_once(control, checkpoint)
+            send_checkpoint_descriptor_once(control, checkpoint, marker)
         }) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -676,6 +997,7 @@ async fn send_checkpoint_descriptor(
 fn send_checkpoint_descriptor_once(
     control: &tokio::net::UnixStream,
     checkpoint: &std::fs::File,
+    marker: u8,
 ) -> std::io::Result<()> {
     use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
     use std::{io::IoSlice, mem::MaybeUninit, os::fd::AsFd as _};
@@ -688,7 +1010,7 @@ fn send_checkpoint_descriptor_once(
             "checkpoint descriptor ancillary buffer is too small",
         ));
     }
-    let marker = [b'C'];
+    let marker = [marker];
     let sent = sendmsg(
         control,
         &[IoSlice::new(&marker)],
@@ -761,7 +1083,7 @@ async fn perform_checkpoint_transport(
         .file
         .as_ref()
         .ok_or_else(|| Error::Execution("sealed checkpoint input is unavailable".to_owned()))?;
-    send_checkpoint_descriptor(control, file).await?;
+    send_checkpoint_descriptor(control, file, b'C').await?;
     input.control.take();
     input.file.take();
 
@@ -776,6 +1098,110 @@ async fn perform_checkpoint_transport(
         worker: metadata,
         binding: input.expected.binding.clone(),
         journal_bytes: acknowledgement.journal_bytes,
+        journal_sha256: acknowledgement.journal_sha256,
+    })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn supervise_checkpoint_restore(
+    mut worker: WorkerProcess,
+    mut stdout: tokio::process::ChildStdout,
+    handshake_timeout: Duration,
+    allowed_supplementary_groups: Vec<u32>,
+    mut input: CheckpointRestoreInput,
+    mut cancelled: oneshot::Receiver<()>,
+) -> Result<WasixCheckpointRestoreMetadata> {
+    let process_id = worker.process_id;
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut cancelled => Err(Error::Cancelled),
+        result = tokio::time::timeout(
+            handshake_timeout,
+            perform_checkpoint_restore(
+                &mut worker,
+                &mut stdout,
+                process_id,
+                &allowed_supplementary_groups,
+                &mut input,
+            ),
+        ) => match result {
+            Ok(result) => result,
+            Err(_) => Err(Error::Timeout),
+        },
+    };
+    if outcome.is_err() && worker.active {
+        drop(stdout);
+        spawn_worker_reaper(worker);
+    }
+    outcome
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn perform_checkpoint_restore(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+    process_id: u32,
+    allowed_supplementary_groups: &[u32],
+    input: &mut CheckpointRestoreInput,
+) -> Result<WasixCheckpointRestoreMetadata> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let ready = read_frame(stdout).await?;
+    let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready)
+        .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
+    metadata.validate(process_id, allowed_supplementary_groups)?;
+
+    let control = input
+        .control
+        .as_mut()
+        .ok_or_else(|| Error::Execution("restore control socket is unavailable".to_owned()))?;
+    let module = input
+        .module
+        .as_ref()
+        .ok_or_else(|| Error::Execution("sealed restore module is unavailable".to_owned()))?;
+    send_checkpoint_descriptor(control, module, b'M').await?;
+    let journal = input
+        .journal
+        .as_ref()
+        .ok_or_else(|| Error::Execution("sealed restore journal is unavailable".to_owned()))?;
+    send_checkpoint_descriptor(control, journal, b'C').await?;
+
+    let frame = read_frame(stdout).await?;
+    let acknowledgement: WasixCheckpointRestoreAck =
+        serde_json::from_slice(&frame).map_err(|error| {
+            Error::Execution(format!("invalid WASIX restore acknowledgement: {error}"))
+        })?;
+    acknowledgement.validate(
+        input.expected.module_bytes,
+        &input.expected.module_sha256,
+        input.expected.journal_bytes,
+        &input.expected.journal_sha256,
+    )?;
+
+    control
+        .write_all(b"E")
+        .await
+        .map_err(|error| Error::Execution(format!("failed to authorize WASIX restore: {error}")))?;
+    control.shutdown().await.map_err(|error| {
+        Error::Execution(format!(
+            "failed to finish WASIX restore authorization: {error}"
+        ))
+    })?;
+    input.control.take();
+    input.module.take();
+    input.journal.take();
+
+    let frame = read_frame(stdout).await?;
+    let completion: WasixCheckpointRestoreCompletion = serde_json::from_slice(&frame)
+        .map_err(|error| Error::Execution(format!("invalid WASIX restore completion: {error}")))?;
+    let restored_stdout = read_output_frame(stdout).await?;
+    completion.validate(&restored_stdout)?;
+    finish_worker_output(worker, stdout, "checkpoint restore").await?;
+    Ok(WasixCheckpointRestoreMetadata {
+        worker: metadata,
+        binding: input.expected.binding.clone(),
+        stdout: restored_stdout,
+        module_sha256: acknowledgement.module_sha256,
         journal_sha256: acknowledgement.journal_sha256,
     })
 }
@@ -896,6 +1322,44 @@ struct CheckpointTransportSupervisor {
     cancel: Option<oneshot::Sender<()>>,
 }
 
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CheckpointRestoreSupervisor {
+    task: tokio::task::JoinHandle<Result<WasixCheckpointRestoreMetadata>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl CheckpointRestoreSupervisor {
+    const fn new(
+        task: tokio::task::JoinHandle<Result<WasixCheckpointRestoreMetadata>>,
+        cancel: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            task,
+            cancel: Some(cancel),
+        }
+    }
+
+    async fn wait(mut self) -> Result<WasixCheckpointRestoreMetadata> {
+        let outcome = (&mut self.task).await.map_err(|error| {
+            Error::Execution(format!(
+                "WASIX checkpoint restore supervisor failed: {error}"
+            ))
+        })?;
+        self.cancel.take();
+        outcome
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl Drop for CheckpointRestoreSupervisor {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 impl CheckpointTransportSupervisor {
     const fn new(
         task: tokio::task::JoinHandle<Result<WasixCheckpointTransportMetadata>>,
@@ -993,6 +1457,27 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
         .read_exact(&mut frame)
         .await
         .map_err(|error| Error::Execution(format!("failed to read WASIX worker frame: {error}")))?;
+    Ok(frame)
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+async fn read_output_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+    let mut length = [0_u8; 4];
+    reader.read_exact(&mut length).await.map_err(|error| {
+        Error::Execution(format!(
+            "failed to read WASIX restore output length: {error}"
+        ))
+    })?;
+    let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+    if length > WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES {
+        return Err(Error::Execution(format!(
+            "WASIX restore output length {length} exceeds the protocol limit"
+        )));
+    }
+    let mut frame = vec![0_u8; length];
+    reader.read_exact(&mut frame).await.map_err(|error| {
+        Error::Execution(format!("failed to read WASIX restore output: {error}"))
+    })?;
     Ok(frame)
 }
 
@@ -1237,7 +1722,7 @@ fn lower_worker_limit(
     Ok([current, hard])
 }
 
-/// Enter the worker isolation profile and write one version 3 ready frame.
+/// Enter the worker isolation profile and write one version 4 ready frame.
 ///
 /// This function must be called from the worker's initial thread before a
 /// Tokio runtime is created and before any guest-controlled bytes are read.
@@ -1260,61 +1745,16 @@ pub fn write_wasix_checkpoint_transport_probe(
     reader: impl std::os::fd::AsFd,
     mut writer: impl Write,
 ) -> std::result::Result<(), String> {
-    use rustix::fs::{FileType, Mode, OFlags, fcntl_get_seals, fstat, open};
+    use rustix::fs::{Mode, OFlags, open};
 
     let isolation = enter_wasix_worker_isolation()?;
     let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
         .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
     write_worker_frame(&mut writer, &ready)?;
 
-    let checkpoint = receive_checkpoint_descriptor(&reader)?;
-    let installed = fcntl_get_seals(&checkpoint)
-        .map_err(|error| format!("checkpoint descriptor does not expose seals: {error}"))?;
-    if !installed.contains(REQUIRED_CHECKPOINT_SEALS) {
-        return Err("checkpoint descriptor is not fully sealed".to_owned());
-    }
-    let stat = fstat(&checkpoint)
-        .map_err(|error| format!("cannot inspect sealed checkpoint descriptor: {error}"))?;
-    let journal_bytes = u64::try_from(stat.st_size)
-        .map_err(|_| "checkpoint descriptor size is negative".to_owned())?;
-    let maximum_checkpoint_bytes = u64::try_from(WASIX_WORKER_MAX_CHECKPOINT_BYTES)
-        .map_err(|_| "worker checkpoint limit overflows u64".to_owned())?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-        || stat.st_nlink != 0
-        || journal_bytes == 0
-        || journal_bytes > maximum_checkpoint_bytes
-    {
-        return Err("checkpoint descriptor identity or size is invalid".to_owned());
-    }
-
-    let mut hash = Sha256::new();
-    let mut offset = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    while offset < journal_bytes {
-        let buffer_bytes = u64::try_from(buffer.len())
-            .map_err(|_| "checkpoint read buffer length overflows u64".to_owned())?;
-        let remaining = usize::try_from((journal_bytes - offset).min(buffer_bytes))
-            .map_err(|_| "checkpoint read length overflows usize".to_owned())?;
-        let read = rustix::io::pread(&checkpoint, &mut buffer[..remaining], offset)
-            .map_err(|error| format!("cannot read sealed checkpoint descriptor: {error}"))?;
-        if read == 0 {
-            return Err("sealed checkpoint descriptor ended prematurely".to_owned());
-        }
-        hash.update(&buffer[..read]);
-        offset = offset
-            .checked_add(
-                u64::try_from(read)
-                    .map_err(|_| "checkpoint read length overflows u64".to_owned())?,
-            )
-            .ok_or_else(|| "checkpoint read offset overflowed".to_owned())?;
-    }
-    let mut trailing = [0_u8; 1];
-    if rustix::io::pread(&checkpoint, &mut trailing, journal_bytes)
-        .map_err(|error| format!("cannot finish sealed checkpoint descriptor: {error}"))?
-        != 0
-    {
-        return Err("sealed checkpoint descriptor contains trailing bytes".to_owned());
-    }
+    let checkpoint = receive_checkpoint_descriptor(&reader, b'C', "checkpoint")?;
+    let accepted =
+        inspect_sealed_worker_input(&checkpoint, WASIX_WORKER_MAX_CHECKPOINT_BYTES, "checkpoint")?;
 
     let null = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|error| format!("cannot open null input for checkpoint worker: {error}"))?;
@@ -1323,8 +1763,8 @@ pub fn write_wasix_checkpoint_transport_probe(
     drop(reader);
 
     let acknowledgement = WasixCheckpointTransportAck {
-        journal_bytes,
-        journal_sha256: hex::encode(hash.finalize()),
+        journal_bytes: accepted.bytes,
+        journal_sha256: accepted.sha256,
     };
     let frame = serde_json::to_vec(&acknowledgement)
         .map_err(|error| format!("cannot encode checkpoint acknowledgement: {error}"))?;
@@ -1332,8 +1772,291 @@ pub fn write_wasix_checkpoint_transport_probe(
 }
 
 #[cfg(all(feature = "wasix", target_os = "linux"))]
+struct SealedWorkerInputMetadata {
+    bytes: u64,
+    sha256: String,
+}
+
+#[cfg(all(feature = "wasix", target_os = "linux"))]
+fn inspect_sealed_worker_input(
+    descriptor: &impl std::os::fd::AsFd,
+    maximum_bytes: usize,
+    label: &str,
+) -> std::result::Result<SealedWorkerInputMetadata, String> {
+    use rustix::fs::{FileType, fcntl_get_seals, fstat};
+
+    let installed = fcntl_get_seals(descriptor)
+        .map_err(|error| format!("{label} descriptor does not expose seals: {error}"))?;
+    if !installed.contains(REQUIRED_CHECKPOINT_SEALS) {
+        return Err(format!("{label} descriptor is not fully sealed"));
+    }
+    let stat = fstat(descriptor)
+        .map_err(|error| format!("cannot inspect sealed {label} descriptor: {error}"))?;
+    let bytes =
+        u64::try_from(stat.st_size).map_err(|_| format!("{label} descriptor size is negative"))?;
+    let maximum_bytes =
+        u64::try_from(maximum_bytes).map_err(|_| format!("worker {label} limit overflows u64"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 0
+        || bytes == 0
+        || bytes > maximum_bytes
+    {
+        return Err(format!("{label} descriptor identity or size is invalid"));
+    }
+
+    let mut hash = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while offset < bytes {
+        let buffer_bytes = u64::try_from(buffer.len())
+            .map_err(|_| format!("{label} read buffer length overflows u64"))?;
+        let remaining = usize::try_from((bytes - offset).min(buffer_bytes))
+            .map_err(|_| format!("{label} read length overflows usize"))?;
+        let read = rustix::io::pread(descriptor, &mut buffer[..remaining], offset)
+            .map_err(|error| format!("cannot read sealed {label} descriptor: {error}"))?;
+        if read == 0 {
+            return Err(format!("sealed {label} descriptor ended prematurely"));
+        }
+        hash.update(&buffer[..read]);
+        offset = offset
+            .checked_add(
+                u64::try_from(read).map_err(|_| format!("{label} read length overflows u64"))?,
+            )
+            .ok_or_else(|| format!("{label} read offset overflowed"))?;
+    }
+    let mut trailing = [0_u8; 1];
+    if rustix::io::pread(descriptor, &mut trailing, bytes)
+        .map_err(|error| format!("cannot finish sealed {label} descriptor: {error}"))?
+        != 0
+    {
+        return Err(format!("sealed {label} descriptor contains trailing bytes"));
+    }
+    Ok(SealedWorkerInputMetadata {
+        bytes,
+        sha256: hex::encode(hash.finalize()),
+    })
+}
+
+/// Restore a checkpoint after validating two sealed inputs and authorization.
+#[doc(hidden)]
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+pub fn write_wasix_checkpoint_restore(
+    mut reader: impl std::io::Read + std::os::fd::AsFd,
+    mut writer: impl Write,
+) -> std::result::Result<(), String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let isolation = enter_wasix_worker_isolation()?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
+        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    write_worker_frame(&mut writer, &ready)?;
+
+    let module = receive_checkpoint_descriptor(&reader, b'M', "module")?;
+    let module_metadata =
+        inspect_sealed_worker_input(&module, WASIX_WORKER_MAX_MODULE_BYTES, "module")?;
+    let journal = receive_checkpoint_descriptor(&reader, b'C', "checkpoint")?;
+    let journal_metadata =
+        inspect_sealed_worker_input(&journal, WASIX_WORKER_MAX_CHECKPOINT_BYTES, "checkpoint")?;
+    let acknowledgement = WasixCheckpointRestoreAck {
+        module_bytes: module_metadata.bytes,
+        module_sha256: module_metadata.sha256,
+        journal_bytes: journal_metadata.bytes,
+        journal_sha256: journal_metadata.sha256,
+    };
+    let frame = serde_json::to_vec(&acknowledgement)
+        .map_err(|error| format!("cannot encode restore acknowledgement: {error}"))?;
+    write_worker_frame(&mut writer, &frame)?;
+
+    let mut authorization = [0_u8; 1];
+    reader
+        .read_exact(&mut authorization)
+        .map_err(|error| format!("cannot read restore authorization: {error}"))?;
+    if authorization != [b'E'] {
+        return Err("restore authorization is malformed".to_owned());
+    }
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .map_err(|error| format!("cannot finish restore authorization: {error}"))?
+        != 0
+    {
+        return Err("restore authorization contains trailing bytes".to_owned());
+    }
+
+    let null = open("/dev/null", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|error| format!("cannot open null input for restore worker: {error}"))?;
+    rustix::stdio::dup2_stdin(&null)
+        .map_err(|error| format!("cannot clear restore worker stdin: {error}"))?;
+    drop(reader);
+
+    let (exit_code, stdout) =
+        execute_wasix_checkpoint_restore(&module, module_metadata.bytes, journal)?;
+    let completion = WasixCheckpointRestoreCompletion {
+        exit_code,
+        stdout_bytes: u64::try_from(stdout.len())
+            .map_err(|_| "restore output length overflows u64".to_owned())?,
+        stdout_sha256: hex::encode(Sha256::digest(&stdout)),
+    };
+    let frame = serde_json::to_vec(&completion)
+        .map_err(|error| format!("cannot encode restore completion: {error}"))?;
+    write_worker_frame(&mut writer, &frame)?;
+    write_worker_output_frame(&mut writer, &stdout)
+}
+
+#[doc(hidden)]
+#[cfg(all(feature = "wasix-checkpoint", not(target_os = "linux")))]
+pub fn write_wasix_checkpoint_restore(
+    _reader: impl Read,
+    _writer: impl Write,
+) -> std::result::Result<(), String> {
+    Err("WASIX checkpoint restore requires Linux".to_owned())
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn execute_wasix_checkpoint_restore(
+    module: &std::os::fd::OwnedFd,
+    module_length: u64,
+    journal: std::os::fd::OwnedFd,
+) -> std::result::Result<(i32, Vec<u8>), String> {
+    use crate::wasix_output::BoundedWasixOutput;
+    use std::sync::Arc;
+    use wasmer::{Engine, Module};
+    use wasmer_wasix::{
+        PluggableRuntime, Runtime, UnsupportedVirtualNetworking, WasiEnvBuilder,
+        bin_factory::spawn_exec_module,
+        runtime::{
+            resolver::MultiSource,
+            task_manager::{VirtualTaskManagerExt, tokio::TokioTaskManager},
+        },
+    };
+
+    let module_bytes = read_sealed_module_bytes(module, module_length)?;
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &module_bytes)
+        .map_err(|error| format!("cannot compile sealed restore module: {error}"))?;
+    drop(module_bytes);
+    let module_hash = module
+        .info()
+        .hash()
+        .ok_or_else(|| "compiled restore module has no content hash".to_owned())?;
+
+    let journal = checked_restore_journal(journal, module_hash.as_bytes())?;
+
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot initialize WASIX restore runtime: {error}"))?;
+    let runtime_handle = tokio_runtime.handle().clone();
+    let _runtime_guard = runtime_handle.enter();
+    let task_manager = Arc::new(TokioTaskManager::new(runtime_handle));
+    let mut concrete_runtime = PluggableRuntime::new(task_manager);
+    concrete_runtime.set_engine(engine);
+    concrete_runtime.set_networking_implementation(UnsupportedVirtualNetworking::default());
+    concrete_runtime.http_client = None;
+    concrete_runtime.set_source(MultiSource::default());
+    concrete_runtime.add_read_only_journal(journal);
+    let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(concrete_runtime);
+
+    let stdout = BoundedWasixOutput::new(WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES)
+        .map_err(|error| format!("cannot allocate bounded restore output: {error}"))?;
+    let mut builder = WasiEnvBuilder::new("restored-checkpoint");
+    builder.set_runtime(runtime.clone());
+    builder.set_module_hash(module_hash);
+    builder.set_stdout(Box::new(stdout.clone()));
+    builder.with_skip_stdio_during_bootstrap(true);
+    let environment = builder
+        .build()
+        .map_err(|error| format!("cannot build WASIX restore environment: {error}"))?;
+    let mut task = spawn_exec_module(module, environment, &runtime)
+        .map_err(|error| format!("cannot spawn restored WASIX process: {error}"))?;
+    let exit_code = runtime
+        .task_manager()
+        .spawn_and_block_on(async move { task.wait_finished().await })
+        .map_err(|error| format!("cannot join restored WASIX process: {error}"))?
+        .map_err(|error| format!("restored WASIX process failed: {error}"))?;
+    if !exit_code.is_success() {
+        return Err(format!("restored WASIX process exited with {exit_code}"));
+    }
+    let output = stdout
+        .finish()
+        .map_err(|error| format!("cannot finish bounded restore output: {error}"))?;
+    Ok((exit_code.raw(), output))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn read_sealed_module_bytes(
+    module: &impl std::os::fd::AsFd,
+    module_length: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    let module_length = usize::try_from(module_length)
+        .map_err(|_| "sealed restore module length overflows usize".to_owned())?;
+    let mut module_bytes = Vec::new();
+    module_bytes
+        .try_reserve_exact(module_length)
+        .map_err(|error| format!("cannot allocate sealed restore module: {error}"))?;
+    module_bytes.resize(module_length, 0);
+    let mut offset = 0_usize;
+    while offset < module_bytes.len() {
+        let positional_offset = u64::try_from(offset)
+            .map_err(|_| "sealed restore module offset overflows u64".to_owned())?;
+        let read = rustix::io::pread(module, &mut module_bytes[offset..], positional_offset)
+            .map_err(|error| format!("cannot read sealed restore module: {error}"))?;
+        if read == 0 {
+            return Err("sealed restore module ended before its acknowledged length".to_owned());
+        }
+        offset = offset
+            .checked_add(read)
+            .ok_or_else(|| "sealed restore module offset overflowed".to_owned())?;
+    }
+    Ok(module_bytes)
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn checked_restore_journal(
+    journal: std::os::fd::OwnedFd,
+    module_hash: &[u8],
+) -> std::result::Result<std::sync::Arc<wasmer_wasix::journal::LogFileJournal>, String> {
+    use wasmer_wasix::journal::{JournalEntry, LogFileJournal, ReadableJournal};
+
+    let journal_file = std::fs::File::from(journal);
+    let inspection_file = journal_file
+        .try_clone()
+        .map_err(|error| format!("cannot clone sealed restore journal: {error}"))?;
+    let inspection = LogFileJournal::from_file(inspection_file)
+        .map_err(|error| format!("cannot open sealed restore journal: {error}"))?;
+    let mut module_records = 0_u32;
+    while let Some(record) = inspection
+        .read()
+        .map_err(|error| format!("cannot inspect sealed restore journal: {error}"))?
+    {
+        if let JournalEntry::InitModuleV1 { wasm_hash } = record.record {
+            if wasm_hash.as_ref() != module_hash {
+                return Err(
+                    "restore journal module hash does not match the sealed module".to_owned(),
+                );
+            }
+            module_records = module_records
+                .checked_add(1)
+                .ok_or_else(|| "restore journal module record count overflowed".to_owned())?;
+        }
+    }
+    if module_records != 1 {
+        return Err(format!(
+            "restore journal contains {module_records} module initialization records"
+        ));
+    }
+    Ok(std::sync::Arc::new(
+        LogFileJournal::from_file(journal_file)
+            .map_err(|error| format!("cannot reopen sealed restore journal: {error}"))?,
+    ))
+}
+
+#[cfg(all(feature = "wasix", target_os = "linux"))]
 fn receive_checkpoint_descriptor(
     control: &impl std::os::fd::AsFd,
+    expected_marker: u8,
+    label: &str,
 ) -> std::result::Result<std::os::fd::OwnedFd, String> {
     use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, recvmsg};
     use std::{io::IoSliceMut, mem::MaybeUninit};
@@ -1348,29 +2071,33 @@ fn receive_checkpoint_descriptor(
         &mut ancillary,
         RecvFlags::CMSG_CLOEXEC,
     )
-    .map_err(|error| format!("cannot receive checkpoint descriptor: {error}"))?;
+    .map_err(|error| format!("cannot receive {label} descriptor: {error}"))?;
     if message.bytes != 1
-        || marker != [b'C']
+        || marker != [expected_marker]
         || message
             .flags
             .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
     {
-        return Err("checkpoint descriptor message is malformed".to_owned());
+        return Err(format!("{label} descriptor message is malformed"));
     }
 
     let mut checkpoint = None;
     for message in ancillary.drain() {
         let RecvAncillaryMessage::ScmRights(mut descriptors) = message else {
-            return Err("checkpoint descriptor message has unexpected metadata".to_owned());
+            return Err(format!(
+                "{label} descriptor message has unexpected metadata"
+            ));
         };
         let descriptor = descriptors
             .next()
-            .ok_or_else(|| "checkpoint descriptor message is empty".to_owned())?;
+            .ok_or_else(|| format!("{label} descriptor message is empty"))?;
         if checkpoint.replace(descriptor).is_some() || descriptors.next().is_some() {
-            return Err("checkpoint descriptor message contains multiple files".to_owned());
+            return Err(format!(
+                "{label} descriptor message contains multiple files"
+            ));
         }
     }
-    checkpoint.ok_or_else(|| "checkpoint descriptor message did not contain a file".to_owned())
+    checkpoint.ok_or_else(|| format!("{label} descriptor message did not contain a file"))
 }
 
 #[doc(hidden)]
@@ -1394,6 +2121,23 @@ fn write_worker_frame(writer: &mut impl Write, frame: &[u8]) -> std::result::Res
         .and_then(|()| writer.write_all(frame))
         .and_then(|()| writer.flush())
         .map_err(|error| format!("cannot write worker metadata: {error}"))
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+fn write_worker_output_frame(
+    writer: &mut impl Write,
+    frame: &[u8],
+) -> std::result::Result<(), String> {
+    if frame.len() > WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES {
+        return Err("restore output exceeds the protocol frame limit".to_owned());
+    }
+    let length = u32::try_from(frame.len())
+        .map_err(|_| "restore output exceeds the protocol frame limit".to_owned())?;
+    writer
+        .write_all(&length.to_be_bytes())
+        .and_then(|()| writer.write_all(frame))
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("cannot write restore output: {error}"))
 }
 
 #[cfg(test)]
