@@ -26,13 +26,14 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 4;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 5;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
 
-const WASIX_WORKER_ISOLATION_PROFILE_VERSION: u32 = 1;
+const WASIX_WORKER_ISOLATION_PROFILE_VERSION: u32 = 2;
 const WASIX_WORKER_MAX_OPEN_FILES: u64 = 64;
+const WASIX_WORKER_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const WASIX_WORKER_MAX_SUPPLEMENTARY_GROUPS: usize = 64;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,7 +52,7 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 ///
 /// The executable is a deployment trust anchor and must be installed at a
 /// trusted, administrator-controlled path. The protocol probe checks reported
-/// compatibility; it is not a signature over the executable. Version 4 of the
+/// compatibility; it is not a signature over the executable. Version 5 of the
 /// worker process boundary is supported on Linux only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasixWorkerConfig {
@@ -345,6 +346,8 @@ pub struct WasixWorkerIsolation {
     pub capability_masks: [u64; 4],
     /// Effective and hard core-file limits, in bytes.
     pub core_file_limits: [u64; 2],
+    /// Effective and hard per-file size limits, in bytes.
+    pub file_size_limits: [u64; 2],
     /// Effective and hard open-file descriptor limits.
     pub open_file_limits: [u64; 2],
     /// Number of inherited descriptors at or above three closed before Ready.
@@ -397,6 +400,12 @@ impl WasixWorkerIsolation {
                 "WASIX worker did not disable core files".to_owned(),
             ));
         }
+        if self.file_size_limits != [WASIX_WORKER_MAX_FILE_BYTES; 2] {
+            return Err(Error::Execution(format!(
+                "WASIX worker file-size limits {:?} differ from the isolation profile",
+                self.file_size_limits
+            )));
+        }
         let [open_files, hard_open_files] = self.open_file_limits;
         if open_files != hard_open_files
             || open_files == 0
@@ -422,6 +431,7 @@ impl WasixWorkerIsolation {
             dumpable: false,
             capability_masks: [0; 4],
             core_file_limits: [0; 2],
+            file_size_limits: [WASIX_WORKER_MAX_FILE_BYTES; 2],
             open_file_limits: [WASIX_WORKER_MAX_OPEN_FILES; 2],
             closed_inherited_descriptor_count: 0,
         }
@@ -1506,6 +1516,7 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
 
     let closed_inherited_descriptor_count = close_inherited_worker_descriptors()?;
     let core_file_limits = lower_worker_limit(Resource::Core, 0)?;
+    let file_size_limits = lower_worker_limit(Resource::Fsize, WASIX_WORKER_MAX_FILE_BYTES)?;
     let open_file_limits = lower_worker_limit(Resource::Nofile, WASIX_WORKER_MAX_OPEN_FILES)?;
 
     rustix::thread::set_keep_capabilities(false)
@@ -1587,6 +1598,7 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
             read_linux_status_mask("CapAmb")?,
         ],
         core_file_limits,
+        file_size_limits,
         open_file_limits,
         closed_inherited_descriptor_count,
     };
@@ -2223,6 +2235,9 @@ mod tests {
         incompatible.push(isolation);
         let mut isolation = compatible.clone();
         isolation.core_file_limits = [1; 2];
+        incompatible.push(isolation);
+        let mut isolation = compatible.clone();
+        isolation.file_size_limits = [WASIX_WORKER_MAX_FILE_BYTES - 1; 2];
         incompatible.push(isolation);
         let mut isolation = compatible;
         isolation.open_file_limits = [65; 2];
