@@ -35,7 +35,11 @@ jobs:
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # PRs restore the default-branch cache but do not create short-lived,
+          # branch-scoped copies that compete for GitHub's cache quota.
           cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: ci-quality
 
       - name: Check formatting
@@ -62,6 +66,10 @@ jobs:
         run: cargo package --locked
 
       - name: Smoke-test a clean packaged consumer
+        env:
+          # Keep the generated consumer source isolated while reusing the
+          # dependency artifacts built by the checks above.
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: scripts/package-consumer-smoke.sh
 
   supply-chain:
@@ -79,6 +87,8 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: true
+          cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: ci-audit
 
       - name: Check licenses, sources, bans, and advisories
@@ -117,7 +127,13 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.event_name != 'pull_request' }}
           shared-key: ci-fixtures
+          workspaces: |
+            . -> target
+            benchmarks/fixtures/json-http-tool -> target
+            benchmarks/fixtures/p2-http-hello -> target
 
       - name: Restore pinned benchmark tools
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
