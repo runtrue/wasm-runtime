@@ -29,8 +29,9 @@ pub use environment::{
     EnvironmentLanguage, EnvironmentManifest,
 };
 pub use error::{
-    Error, Result, WasixCheckpointRestoreFailure, WasixCheckpointRestoreFailureReason,
-    WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
+    Error, Result, WasixCheckpointCaptureFailure, WasixCheckpointCaptureFailureReason,
+    WasixCheckpointCapturePhase, WasixCheckpointRestoreFailure,
+    WasixCheckpointRestoreFailureReason, WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
 };
 pub use http::{
     HttpDispatchMetadata, HttpRequest, HttpResponse, HttpService, HttpServiceConfig,

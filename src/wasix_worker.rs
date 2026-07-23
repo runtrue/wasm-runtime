@@ -1,7 +1,9 @@
 #[cfg(feature = "wasix-checkpoint")]
 use crate::{
-    CapturedWasixJournal, CommandInput, WasixCheckpointRestoreFailure,
-    WasixCheckpointRestoreFailureReason, WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
+    CapturedWasixJournal, CommandInput, WasixCheckpointCaptureFailure,
+    WasixCheckpointCaptureFailureReason, WasixCheckpointCapturePhase,
+    WasixCheckpointRestoreFailure, WasixCheckpointRestoreFailureReason,
+    WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
 };
 use crate::{Error, Result, VerifiedWasixCheckpoint, WasixCheckpointBinding};
 use serde::{Deserialize, Serialize};
@@ -1228,7 +1230,7 @@ async fn capture_wasix_checkpoint_linux(
         .current_dir("/")
         .stdin(child_control)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut worker = spawn_wasix_worker(
         config,
@@ -1242,6 +1244,9 @@ async fn capture_wasix_checkpoint_linux(
         worker.child.stdout.take().ok_or_else(|| {
             Error::Execution("WASIX capture worker stdout was not piped".to_owned())
         })?;
+    let stderr = worker.child.stderr.take().ok_or_else(|| {
+        Error::Execution("WASIX capture worker diagnostics were not piped".to_owned())
+    })?;
     let expected = ExpectedCheckpointCapture {
         binding,
         module_bytes: prepared_module.bytes,
@@ -1264,7 +1269,7 @@ async fn capture_wasix_checkpoint_linux(
         cancellation,
     };
     let supervisor = tokio::spawn(supervise_checkpoint_capture(
-        worker, stdout, operation, cancelled,
+        worker, stdout, stderr, operation, cancelled,
     ));
     CheckpointCaptureSupervisor::new(supervisor, cancel)
         .wait()
@@ -2137,9 +2142,11 @@ async fn collect_checkpoint_restore_output(
 async fn supervise_checkpoint_capture(
     mut worker: WorkerProcess,
     mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
     mut operation: CheckpointCaptureOperation,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<WasixCheckpointCapture> {
+    let diagnostics = tokio::spawn(async move { read_worker_diagnostics(&mut stderr).await });
     let process_id = worker.process_id;
     let cancellation = operation.cancellation.clone();
     let outcome = tokio::select! {
@@ -2154,13 +2161,122 @@ async fn supervise_checkpoint_capture(
             operation.handshake_timeout,
             operation.execution_timeout,
             &mut operation.input,
-        ) => result,
+        ) => match result {
+            Ok(capture) => Ok(capture),
+            Err(CaptureOperationError::Failure(failure)) => {
+                let public_failure = WasixCheckpointCaptureFailure::new(
+                    failure.phase,
+                    failure.reason,
+                    WasixWorkerDiagnostics::new(Vec::new(), false),
+                );
+                let public_failure = if let Some(status) = failure.exit_status {
+                    let (exit_code, exit_signal) = worker_exit_status_parts(status);
+                    public_failure.with_exit_status(exit_code, exit_signal)
+                } else {
+                    public_failure
+                };
+                Err(Error::CheckpointCapture(public_failure))
+            }
+            Err(CaptureOperationError::Timeout) => Err(Error::Timeout),
+        },
     };
+
+    let mut observed_exit_status = None;
     if outcome.is_err() && worker.active {
         drop(stdout);
-        spawn_worker_reaper(worker);
+        if matches!(&outcome, Err(Error::CheckpointCapture(_))) {
+            observed_exit_status = observe_failed_worker_exit(&mut worker).await;
+        }
+        worker.kill_tree();
+        if observed_exit_status.is_none() {
+            let _ = worker.child.start_kill();
+            let _ = worker.child.wait().await;
+        }
+        worker.disarm();
     }
-    outcome
+    let diagnostics = match diagnostics.await {
+        Ok(Ok(diagnostics)) => diagnostics,
+        Ok(Err(_)) | Err(_) => WasixWorkerDiagnostics::new(Vec::new(), true),
+    };
+    match outcome {
+        Ok(capture) => Ok(capture),
+        Err(Error::CheckpointCapture(failure)) => {
+            let exit_status = observed_exit_status.map(worker_exit_status_parts);
+            let exit_code = exit_status.map_or_else(|| failure.exit_code(), |status| status.0);
+            let exit_signal = exit_status.map_or_else(|| failure.exit_signal(), |status| status.1);
+            Err(Error::CheckpointCapture(
+                WasixCheckpointCaptureFailure::new(failure.phase(), failure.reason(), diagnostics)
+                    .with_exit_status(exit_code, exit_signal),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+enum CaptureOperationError {
+    Failure(CaptureOperationFailure),
+    Timeout,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl From<CaptureOperationFailure> for CaptureOperationError {
+    fn from(failure: CaptureOperationFailure) -> Self {
+        Self::Failure(failure)
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct CaptureOperationFailure {
+    phase: WasixCheckpointCapturePhase,
+    reason: WasixCheckpointCaptureFailureReason,
+    exit_status: Option<std::process::ExitStatus>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl CaptureOperationFailure {
+    const fn new(
+        phase: WasixCheckpointCapturePhase,
+        reason: WasixCheckpointCaptureFailureReason,
+    ) -> Self {
+        Self {
+            phase,
+            reason,
+            exit_status: None,
+        }
+    }
+
+    const fn protocol(phase: WasixCheckpointCapturePhase) -> Self {
+        Self::new(phase, WasixCheckpointCaptureFailureReason::Protocol)
+    }
+
+    const fn runtime() -> Self {
+        Self::new(
+            WasixCheckpointCapturePhase::Execution,
+            WasixCheckpointCaptureFailureReason::Runtime,
+        )
+    }
+
+    fn worker_process(status: std::process::ExitStatus) -> Self {
+        Self {
+            phase: WasixCheckpointCapturePhase::Shutdown,
+            reason: WasixCheckpointCaptureFailureReason::WorkerProcess,
+            exit_status: Some(status),
+        }
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn observe_failed_worker_exit(
+    worker: &mut WorkerProcess,
+) -> Option<std::process::ExitStatus> {
+    if let Ok(Some(status)) = worker.child.try_wait() {
+        return Some(status);
+    }
+    tokio::time::timeout(Duration::from_millis(100), worker.child.wait())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -2172,97 +2288,31 @@ async fn perform_checkpoint_capture(
     handshake_timeout: Duration,
     execution_timeout: Duration,
     input: &mut CheckpointCaptureInput,
-) -> Result<WasixCheckpointCapture> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let (metadata, acknowledgement) = tokio::time::timeout(handshake_timeout, async {
-        let ready = read_frame(stdout).await?;
-        let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready).map_err(|error| {
-            Error::Execution(format!("invalid WASIX capture Ready frame: {error}"))
-        })?;
-        metadata.validate(
+) -> std::result::Result<WasixCheckpointCapture, CaptureOperationError> {
+    let (metadata, acknowledgement) = tokio::time::timeout(
+        handshake_timeout,
+        prepare_checkpoint_capture(
+            stdout,
             process_id,
             &worker.worker_build_sha256,
             allowed_supplementary_groups,
-        )?;
-        let control = input
-            .control
-            .as_mut()
-            .ok_or_else(|| Error::Execution("capture control socket is unavailable".to_owned()))?;
-        let module = input
-            .module
-            .as_ref()
-            .ok_or_else(|| Error::Execution("sealed capture module is unavailable".to_owned()))?;
-        send_checkpoint_descriptor(control, module, b'M').await?;
-        write_control_frame(control, &input.request).await?;
-        let frame = read_frame(stdout).await?;
-        let acknowledgement: WasixCheckpointCaptureAck =
-            serde_json::from_slice(&frame).map_err(|error| {
-                Error::Execution(format!("invalid WASIX capture acknowledgement: {error}"))
-            })?;
-        if acknowledgement.module_bytes != input.expected.module_bytes
-            || acknowledgement.module_sha256 != input.expected.module_sha256
-            || acknowledgement.request_bytes != input.expected.request_bytes
-            || acknowledgement.request_sha256 != input.expected.request_sha256
-        {
-            return Err(Error::Execution(
-                "WASIX capture acknowledgement did not match the sealed inputs".to_owned(),
-            ));
-        }
-        control.write_all(b"E").await.map_err(|error| {
-            Error::Execution(format!("failed to authorize WASIX capture: {error}"))
-        })?;
-        control.shutdown().await.map_err(|error| {
-            Error::Execution(format!(
-                "failed to finish WASIX capture authorization: {error}"
-            ))
-        })?;
-        input.control.take();
-        input.module.take();
-        Ok((metadata, acknowledgement))
-    })
+            input,
+        ),
+    )
     .await
-    .map_err(|_| Error::Timeout)??;
-
-    let (completion, journal, captured_stdout, captured_stderr) =
-        tokio::time::timeout(execution_timeout, async {
-            let frame = read_frame(stdout).await?;
-            let completion: WasixCheckpointCaptureCompletion = serde_json::from_slice(&frame)
-                .map_err(|error| {
-                    Error::Execution(format!("invalid WASIX capture completion: {error}"))
-                })?;
-            let journal = read_bounded_worker_frame(
-                stdout,
-                WASIX_WORKER_MAX_CHECKPOINT_BYTES,
-                false,
-                "capture journal",
-            )
-            .await?;
-            let captured_stdout = read_bounded_worker_frame(
-                stdout,
-                WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
-                true,
-                "capture stdout",
-            )
-            .await?;
-            let captured_stderr = read_bounded_worker_frame(
-                stdout,
-                WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
-                true,
-                "capture stderr",
-            )
-            .await?;
-            completion.validate(&journal, &captured_stdout, &captured_stderr)?;
-            finish_worker_output(worker, stdout, "checkpoint capture").await?;
-            Ok::<_, Error>((completion, journal, captured_stdout, captured_stderr))
-        })
-        .await
-        .map_err(|_| Error::Timeout)??;
+    .map_err(|_| CaptureOperationError::Timeout)??;
+    let (completion, journal, captured_stdout, captured_stderr) = tokio::time::timeout(
+        execution_timeout,
+        collect_checkpoint_capture_output(worker, stdout),
+    )
+    .await
+    .map_err(|_| CaptureOperationError::Timeout)??;
     let journal = CapturedWasixJournal::from_attested_worker_capture(
         journal,
         input.expected.binding.clone(),
         metadata.worker_build_sha256.clone(),
-    )?;
+    )
+    .map_err(|_| CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Output))?;
     Ok(WasixCheckpointCapture {
         worker: metadata,
         binding: input.expected.binding.clone(),
@@ -2272,6 +2322,139 @@ async fn perform_checkpoint_capture(
         journal_sha256: completion.journal_sha256,
         journal,
     })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn prepare_checkpoint_capture(
+    stdout: &mut tokio::process::ChildStdout,
+    process_id: u32,
+    expected_worker_build_sha256: &str,
+    allowed_supplementary_groups: &[u32],
+    input: &mut CheckpointCaptureInput,
+) -> std::result::Result<(WasixWorkerMetadata, WasixCheckpointCaptureAck), CaptureOperationFailure>
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let ready_failure = || CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Ready);
+    let ready = read_frame(stdout).await.map_err(|_| ready_failure())?;
+    let metadata: WasixWorkerMetadata =
+        serde_json::from_slice(&ready).map_err(|_| ready_failure())?;
+    metadata
+        .validate(
+            process_id,
+            expected_worker_build_sha256,
+            allowed_supplementary_groups,
+        )
+        .map_err(|_| ready_failure())?;
+
+    let input_failure = || CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Input);
+    let control = input.control.as_mut().ok_or_else(input_failure)?;
+    let module = input.module.as_ref().ok_or_else(input_failure)?;
+    send_checkpoint_descriptor(control, module, b'M')
+        .await
+        .map_err(|_| input_failure())?;
+    write_control_frame(control, &input.request)
+        .await
+        .map_err(|_| input_failure())?;
+    let frame = read_frame(stdout).await.map_err(|_| input_failure())?;
+    let acknowledgement: WasixCheckpointCaptureAck =
+        serde_json::from_slice(&frame).map_err(|_| input_failure())?;
+    if acknowledgement.module_bytes != input.expected.module_bytes
+        || acknowledgement.module_sha256 != input.expected.module_sha256
+        || acknowledgement.request_bytes != input.expected.request_bytes
+        || acknowledgement.request_sha256 != input.expected.request_sha256
+    {
+        return Err(input_failure());
+    }
+
+    let authorization_failure =
+        || CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Authorization);
+    control
+        .write_all(b"E")
+        .await
+        .map_err(|_| authorization_failure())?;
+    control
+        .shutdown()
+        .await
+        .map_err(|_| authorization_failure())?;
+    input.control.take();
+    input.module.take();
+    Ok((metadata, acknowledgement))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn collect_checkpoint_capture_output(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+) -> std::result::Result<
+    (WasixCheckpointCaptureCompletion, Vec<u8>, Vec<u8>, Vec<u8>),
+    CaptureOperationFailure,
+> {
+    let frame = read_frame(stdout)
+        .await
+        .map_err(|_| CaptureOperationFailure::runtime())?;
+    let completion: WasixCheckpointCaptureCompletion = serde_json::from_slice(&frame)
+        .map_err(|_| CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Execution))?;
+    let output_failure = || CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Output);
+    let journal = read_bounded_worker_frame(
+        stdout,
+        WASIX_WORKER_MAX_CHECKPOINT_BYTES,
+        false,
+        "capture journal",
+    )
+    .await
+    .map_err(|_| output_failure())?;
+    let captured_stdout = read_bounded_worker_frame(
+        stdout,
+        WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+        true,
+        "capture stdout",
+    )
+    .await
+    .map_err(|_| output_failure())?;
+    let captured_stderr = read_bounded_worker_frame(
+        stdout,
+        WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
+        true,
+        "capture stderr",
+    )
+    .await
+    .map_err(|_| output_failure())?;
+    completion
+        .validate(&journal, &captured_stdout, &captured_stderr)
+        .map_err(|_| output_failure())?;
+    finish_checkpoint_capture_output(worker, stdout).await?;
+    Ok((completion, journal, captured_stdout, captured_stderr))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn finish_checkpoint_capture_output(
+    worker: &mut WorkerProcess,
+    stdout: &mut tokio::process::ChildStdout,
+) -> std::result::Result<(), CaptureOperationFailure> {
+    let shutdown_failure =
+        || CaptureOperationFailure::protocol(WasixCheckpointCapturePhase::Shutdown);
+    let mut trailing = [0_u8; 1];
+    if stdout
+        .read(&mut trailing)
+        .await
+        .map_err(|_| shutdown_failure())?
+        != 0
+    {
+        return Err(shutdown_failure());
+    }
+    let status = worker.child.wait().await.map_err(|_| {
+        CaptureOperationFailure::new(
+            WasixCheckpointCapturePhase::Shutdown,
+            WasixCheckpointCaptureFailureReason::WorkerProcess,
+        )
+    })?;
+    worker.kill_tree();
+    worker.disarm();
+    if !status.success() {
+        return Err(CaptureOperationFailure::worker_process(status));
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -3458,7 +3641,7 @@ fn execute_wasix_checkpoint_capture(
     let runtime_handle = tokio_runtime.handle().clone();
     let runtime_guard = runtime_handle.enter();
     let task_manager = Arc::new(TokioTaskManager::new(runtime_handle.clone()));
-    let mut concrete_runtime = PluggableRuntime::new(task_manager);
+    let mut concrete_runtime = PluggableRuntime::new(task_manager.clone());
     concrete_runtime.set_engine(engine);
     concrete_runtime.set_networking_implementation(UnsupportedVirtualNetworking::default());
     concrete_runtime.http_client = None;
@@ -3493,6 +3676,7 @@ fn execute_wasix_checkpoint_capture(
     if !exit_code.is_success() {
         return Err(format!("WASIX capture process exited with {exit_code}"));
     }
+    quiesce_wasix_task_manager(&task_manager);
     drop(runtime);
     drop(journal);
     drop(runtime_guard);
@@ -3503,24 +3687,32 @@ fn execute_wasix_checkpoint_capture(
     let captured_stderr = stderr
         .finish()
         .map_err(|error| format!("cannot finish bounded capture stderr: {error}"))?;
-    let checkpoint_end = inspect_captured_journal(&journal_file, &expected_module_hash)?;
-    journal_file
-        .set_len(checkpoint_end)
-        .map_err(|error| format!("cannot truncate capture journal prefix: {error}"))?;
-    rustix::fs::fcntl_add_seals(&journal_file, REQUIRED_CHECKPOINT_SEALS)
-        .map_err(|error| format!("cannot seal capture journal: {error}"))?;
-    let accepted = inspect_sealed_worker_input(
-        &journal_file,
-        WASIX_WORKER_MAX_CHECKPOINT_BYTES,
-        "capture journal",
-    )?;
-    let captured_journal = read_sealed_module_bytes(&journal_file, accepted.bytes)?;
+    let captured_journal = finalize_capture_journal(&journal_file, &expected_module_hash)?;
     Ok(ExecutedCheckpointCapture {
         exit_code: exit_code.raw(),
         journal: captured_journal,
         stdout: captured_stdout,
         stderr: captured_stderr,
     })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn finalize_capture_journal(
+    journal_file: &std::fs::File,
+    expected_module_hash: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
+    let checkpoint_end = inspect_captured_journal(journal_file, expected_module_hash)?;
+    journal_file
+        .set_len(checkpoint_end)
+        .map_err(|error| format!("cannot truncate capture journal prefix: {error}"))?;
+    rustix::fs::fcntl_add_seals(journal_file, REQUIRED_CHECKPOINT_SEALS)
+        .map_err(|error| format!("cannot seal capture journal: {error}"))?;
+    let accepted = inspect_sealed_worker_input(
+        journal_file,
+        WASIX_WORKER_MAX_CHECKPOINT_BYTES,
+        "capture journal",
+    )?;
+    read_sealed_module_bytes(journal_file, accepted.bytes)
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -3919,6 +4111,167 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout)
                 .contains("pinned_worker_survives_path_replacement")
+        );
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    fn fake_capture_operation(
+        cancellation: crate::CancellationToken,
+    ) -> CheckpointCaptureOperation {
+        let binding = WasixCheckpointBinding::new(
+            format!("sha256:{}", "1".repeat(64)),
+            "2".repeat(64),
+            "_start",
+            "capture-diagnostics-test",
+            1,
+        )
+        .expect("test binding must be valid");
+        CheckpointCaptureOperation {
+            handshake_timeout: Duration::from_secs(5),
+            execution_timeout: Duration::from_secs(5),
+            allowed_supplementary_groups: Vec::new(),
+            input: CheckpointCaptureInput {
+                control: None,
+                module: None,
+                request: Vec::new(),
+                expected: ExpectedCheckpointCapture {
+                    binding,
+                    module_bytes: 1,
+                    module_sha256: "2".repeat(64),
+                    request_bytes: 1,
+                    request_sha256: "3".repeat(64),
+                },
+            },
+            cancellation,
+        }
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    fn spawn_fake_capture_worker(
+        script: &str,
+    ) -> (
+        WorkerProcess,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    ) {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().expect("fake capture worker must spawn");
+        let mut worker =
+            WorkerProcess::new(child, "0".repeat(64)).expect("fake worker must expose its pid");
+        let stdout = worker
+            .child
+            .stdout
+            .take()
+            .expect("fake worker stdout must be piped");
+        let stderr = worker
+            .child
+            .stderr
+            .take()
+            .expect("fake worker stderr must be piped");
+        (worker, stdout, stderr)
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    #[tokio::test]
+    async fn premature_capture_worker_eof_reports_phase_status_and_diagnostics() {
+        let (worker, stdout, stderr) =
+            spawn_fake_capture_worker("printf 'premature capture EOF diagnostic' >&2; exit 17");
+        let (_cancel, cancelled) = oneshot::channel();
+        let error = supervise_checkpoint_capture(
+            worker,
+            stdout,
+            stderr,
+            fake_capture_operation(crate::CancellationToken::new()),
+            cancelled,
+        )
+        .await
+        .expect_err("premature worker EOF must fail capture");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let Error::CheckpointCapture(failure) = error else {
+            panic!("premature EOF must be a structured capture failure: {error:?}");
+        };
+
+        assert_eq!(failure.phase(), WasixCheckpointCapturePhase::Ready);
+        assert_eq!(
+            failure.reason(),
+            WasixCheckpointCaptureFailureReason::Protocol
+        );
+        assert_eq!(failure.exit_code(), Some(17));
+        assert_eq!(failure.exit_signal(), None);
+        assert_eq!(
+            failure.diagnostics().as_bytes(),
+            b"premature capture EOF diagnostic"
+        );
+        assert!(!display.contains("premature capture EOF diagnostic"));
+        assert!(!debug.contains("premature capture EOF diagnostic"));
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    #[tokio::test]
+    async fn signalled_capture_worker_reports_its_termination_signal() {
+        let (worker, stdout, stderr) =
+            spawn_fake_capture_worker("printf 'signalled capture diagnostic' >&2; kill -TERM $$");
+        let (_cancel, cancelled) = oneshot::channel();
+        let error = supervise_checkpoint_capture(
+            worker,
+            stdout,
+            stderr,
+            fake_capture_operation(crate::CancellationToken::new()),
+            cancelled,
+        )
+        .await
+        .expect_err("signalled worker must fail capture");
+        let Error::CheckpointCapture(failure) = error else {
+            panic!("worker signal must be a structured capture failure: {error:?}");
+        };
+
+        assert_eq!(failure.phase(), WasixCheckpointCapturePhase::Ready);
+        assert_eq!(failure.exit_code(), None);
+        assert_eq!(failure.exit_signal(), Some(15));
+        assert_eq!(
+            failure.diagnostics().as_bytes(),
+            b"signalled capture diagnostic"
+        );
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    #[tokio::test]
+    async fn capture_cancellation_kills_and_reaps_the_worker_group() {
+        let (worker, stdout, stderr) = spawn_fake_capture_worker("sleep 30");
+        let process_id = worker.process_id;
+        let cancellation = crate::CancellationToken::new();
+        let cancel_capture = cancellation.clone();
+        let (_cancel, cancelled) = oneshot::channel();
+        let supervisor = tokio::spawn(supervise_checkpoint_capture(
+            worker,
+            stdout,
+            stderr,
+            fake_capture_operation(cancellation),
+            cancelled,
+        ));
+        tokio::task::yield_now().await;
+        cancel_capture.cancel();
+
+        assert!(matches!(
+            supervisor.await.expect("supervisor must be joinable"),
+            Err(Error::Cancelled)
+        ));
+        let process = rustix::process::Pid::from_raw(process_id.cast_signed())
+            .expect("fake worker pid must be valid");
+        assert_eq!(
+            rustix::process::test_kill_process(process),
+            Err(rustix::io::Errno::SRCH),
+            "cancelled capture worker must be synchronously reaped"
         );
     }
 
