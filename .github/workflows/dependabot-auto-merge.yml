@@ -1,82 +1,147 @@
 name: Dependabot auto-merge
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: [CI, Fuzz]
+    types: [completed]
 
 concurrency:
-  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  group: dependabot-auto-merge-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
-# This workflow runs trusted code from the default branch and never checks out
-# the pull request. Keep these permissions scoped to this workflow only.
+# workflow_run executes this trusted workflow from the default branch with a
+# write-capable token. It never checks out or executes pull-request code.
 permissions:
   checks: read
   contents: write
   pull-requests: write
 
 jobs:
-  merge-safe-update:
-    name: Merge safe dependency update
+  merge-verified-update:
+    name: Merge verified dependency update
     if: >-
       github.repository == 'runtrue/wasm-runtime' &&
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.base.ref == github.event.repository.default_branch &&
-      github.event.pull_request.draft == false
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].number != null
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 10
     steps:
-      - name: Read verified Dependabot metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Select low-risk updates
-        id: policy
+      - name: Verify the Dependabot pull request
+        id: verify
         env:
-          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
-          MAINTAINER_CHANGES: ${{ steps.metadata.outputs.maintainer-changes }}
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
-        shell: bash
-        run: |
-          eligible=false
-          if [[ "$UPDATE_TYPE" == "version-update:semver-patch" ]] &&
-             [[ "$MAINTAINER_CHANGES" == "false" ]] &&
-             [[ "$ECOSYSTEM" == "cargo" || "$ECOSYSTEM" == "github-actions" ]]; then
-            eligible=true
-          fi
-
-          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Dependabot merge policy"
-            echo
-            echo "- Ecosystem: \`$ECOSYSTEM\`"
-            echo "- Update: \`$UPDATE_TYPE\`"
-            echo "- Maintainer changes: \`$MAINTAINER_CHANGES\`"
-            echo "- Eligible: \`$eligible\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Wait for the matching CI checks
-        if: steps.policy.outputs.eligible == 'true'
-        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
-          required_checks=(
-            "Rust quality and package"
-            "WASIX checkpoint migration"
-            "Dependency policy and advisories"
-            "Reproducible WASI fixtures"
-          )
+          pr="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
 
+          author="$(jq -r '.user.login' <<< "$pr")"
+          base_ref="$(jq -r '.base.ref' <<< "$pr")"
+          draft="$(jq -r '.draft' <<< "$pr")"
+          head_ref="$(jq -r '.head.ref' <<< "$pr")"
+          head_repo="$(jq -r '.head.repo.full_name' <<< "$pr")"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          state="$(jq -r '.state' <<< "$pr")"
+
+          if [[ "$author" != "dependabot[bot]" ]] ||
+             [[ "$base_ref" != "${{ github.event.repository.default_branch }}" ]] ||
+             [[ "$draft" != "false" ]] ||
+             [[ "$head_repo" != "$REPOSITORY" ]] ||
+             [[ "$head_sha" != "$EXPECTED_HEAD_SHA" ]] ||
+             [[ "$state" != "open" ]]; then
+            echo "The pull request no longer matches the trusted Dependabot event" >&2
+            exit 1
+          fi
+
+          commits="$(
+            gh api --paginate \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100"
+          )"
+          if ! jq -s -e '
+            flatten | length > 0 and
+            all(.[];
+              .author.login == "dependabot[bot]" and
+              .commit.verification.verified == true)
+          ' <<< "$commits" >/dev/null; then
+            echo "Every pull-request commit must be verified and authored by Dependabot" >&2
+            exit 1
+          fi
+
+          mapfile -t changed_files < <(
+            gh api --paginate \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              --jq '.[].filename'
+          )
+          if (( ${#changed_files[@]} == 0 )); then
+            echo "Dependabot pull request contains no changed files" >&2
+            exit 1
+          fi
+
+          case "$head_ref" in
+            dependabot/cargo/*)
+              ecosystem=cargo
+              allowed_file='^(Cargo\.toml|Cargo\.lock)$'
+              ;;
+            dependabot/github_actions/*)
+              ecosystem=github-actions
+              allowed_file='^\.github/workflows/[^/]+\.ya?ml$'
+              ;;
+            *)
+              echo "Unsupported Dependabot branch: $head_ref" >&2
+              exit 1
+              ;;
+          esac
+
+          for changed_file in "${changed_files[@]}"; do
+            if [[ ! "$changed_file" =~ $allowed_file ]]; then
+              echo "Unexpected $ecosystem update file: $changed_file" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "base-ref=$base_ref"
+            echo "head-sha=$head_sha"
+            echo "pr-url=$(jq -r '.html_url' <<< "$pr")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Dependabot merge policy"
+            echo
+            echo "- Pull request: #$PR_NUMBER"
+            echo "- Ecosystem: \`$ecosystem\`"
+            echo "- Verified commits: \`true\`"
+            echo "- Allowed files only: \`true\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm every matching check passed
+        id: checks
+        env:
+          BASE_REF: ${{ steps.verify.outputs.base-ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          mapfile -t required_checks < <(
+            gh api \
+              "repos/$REPOSITORY/branches/$BASE_REF/protection/required_status_checks" \
+              --jq '.contexts[]'
+          )
+          if (( ${#required_checks[@]} == 0 )); then
+            echo "The base branch does not declare any required checks" >&2
+            exit 1
+          fi
+
+          needs_fuzz=false
           while IFS= read -r changed_file; do
             case "$changed_file" in
               fuzz/*|.github/workflows/fuzz.yml|Cargo.toml|Cargo.lock|src/*|tests/fixtures/*)
-                required_checks+=("Runtime trust boundaries")
+                needs_fuzz=true
                 break
                 ;;
             esac
@@ -85,88 +150,91 @@ jobs:
               "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
               --jq '.[].filename'
           )
+          if [[ "$needs_fuzz" == "true" ]] &&
+             [[ ! " ${required_checks[*]} " =~ " Runtime trust boundaries " ]]; then
+            required_checks+=("Runtime trust boundaries")
+          fi
 
-          deadline=$((SECONDS + 2700))
-          while (( SECONDS < deadline )); do
-            check_runs="$(
-              gh api "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100"
+          check_runs="$(
+            gh api "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100"
+          )"
+          ready=true
+          for check_name in "${required_checks[@]}"; do
+            state="$(
+              jq -r --arg name "$check_name" '
+                [.check_runs[]
+                  | select(.name == $name and .app.slug == "github-actions")]
+                | sort_by(.id)
+                | last
+                | if . == null then
+                    "missing:"
+                  else
+                    "\(.status):\(.conclusion // "")"
+                  end
+              ' <<< "$check_runs"
             )"
-            waiting=()
-
-            for check_name in "${required_checks[@]}"; do
-              state="$(
-                jq -r --arg name "$check_name" '
-                  [.check_runs[]
-                    | select(.name == $name and .app.slug == "github-actions")]
-                  | sort_by(.id)
-                  | last
-                  | if . == null then
-                      "missing:"
-                    else
-                      "\(.status):\(.conclusion // "")"
-                    end
-                ' <<< "$check_runs"
-              )"
-
-              case "$state" in
-                completed:success) ;;
-                completed:*)
-                  echo "$check_name did not pass ($state)" >&2
-                  exit 1
-                  ;;
-                *) waiting+=("$check_name ($state)") ;;
-              esac
-            done
-
-            if (( ${#waiting[@]} == 0 )); then
-              printf 'All required checks passed for %s\n' "$HEAD_SHA"
-              exit 0
-            fi
-
-            printf 'Waiting for: %s\n' "${waiting[*]}"
-            sleep 30
+            case "$state" in
+              completed:success) ;;
+              completed:*)
+                echo "$check_name did not pass for $HEAD_SHA ($state)" >&2
+                exit 1
+                ;;
+              *)
+                echo "Waiting for $check_name on $HEAD_SHA ($state)"
+                ready=false
+                ;;
+            esac
           done
-
-          echo "Timed out waiting for required checks" >&2
-          exit 1
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
 
       - name: Verify immutable merge inputs
-        if: steps.policy.outputs.eligible == 'true'
+        if: steps.checks.outputs.ready == 'true'
         id: merge-inputs
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
-          current_head_sha="$(
-            gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha'
-          )"
+          pr="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          current_head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          pr_base_sha="$(jq -r '.base.sha' <<< "$pr")"
+          base_ref="$(jq -r '.base.ref' <<< "$pr")"
           current_base_sha="$(
-            gh api "repos/$REPOSITORY/commits/$BASE_REF" --jq '.sha'
+            gh api "repos/$REPOSITORY/commits/$base_ref" --jq '.sha'
           )"
 
           if [[ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
-            echo "Dependabot updated the PR; the replacement run will evaluate it" >&2
+            echo "Dependabot updated the pull request; a replacement run will evaluate it" >&2
             echo "merge=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$current_base_sha" != "$EVENT_BASE_SHA" ]]; then
+          elif [[ "$current_base_sha" != "$pr_base_sha" ]]; then
             echo "The base branch moved; waiting for Dependabot to rebase" >&2
             echo "merge=false" >> "$GITHUB_OUTPUT"
           else
             echo "merge=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Squash and merge
+      - name: Approve verified Dependabot update
         if: >-
-          steps.policy.outputs.eligible == 'true' &&
+          steps.checks.outputs.ready == 'true' &&
           steps.merge-inputs.outputs.merge == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_URL: ${{ steps.verify.outputs.pr-url }}
+        run: >-
+          gh pr review "$PR_URL"
+          --approve
+          --body "All required checks passed for this verified Dependabot update."
+
+      - name: Squash and merge
+        if: >-
+          steps.checks.outputs.ready == 'true' &&
+          steps.merge-inputs.outputs.merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
+          PR_URL: ${{ steps.verify.outputs.pr-url }}
         run: >-
           gh pr merge "$PR_URL"
           --squash
