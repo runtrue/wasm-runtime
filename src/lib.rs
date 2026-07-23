@@ -21,7 +21,7 @@ mod wasix_worker;
 pub use cache::{AotAuthenticationKey, DiskCacheConfig};
 pub use checkpoint::{
     CapturedWasixJournal, CheckpointAuthenticationKey, VerifiedWasixCheckpoint,
-    WasixCheckpointBinding, WasixCheckpointCodec,
+    VerifiedWasixCheckpointView, WasixCheckpointBinding, WasixCheckpointCodec,
 };
 pub use config::{RuntimeConfig, RuntimeLimits};
 pub use environment::{
