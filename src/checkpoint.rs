@@ -144,7 +144,7 @@ pub struct WasixCheckpointCodec {
 /// after validating those values on its own trusted output.
 pub struct CapturedWasixJournal {
     bytes: Vec<u8>,
-    module_sha256: String,
+    binding: WasixCheckpointBinding,
     explicit_snapshot: bool,
 }
 
@@ -153,7 +153,7 @@ impl std::fmt::Debug for CapturedWasixJournal {
         formatter
             .debug_struct("CapturedWasixJournal")
             .field("bytes", &self.bytes.len())
-            .field("module_sha256", &self.module_sha256)
+            .field("binding", &self.binding)
             .field("explicit_snapshot", &self.explicit_snapshot)
             .finish()
     }
@@ -163,15 +163,21 @@ impl CapturedWasixJournal {
     #[cfg(any(feature = "wasix-checkpoint", test))]
     pub(crate) fn from_attested_worker_capture(
         bytes: Vec<u8>,
-        module_sha256: String,
+        binding: WasixCheckpointBinding,
     ) -> Result<Self> {
-        validate_sha256("captured journal module digest", &module_sha256)?;
+        binding.validate()?;
         scan_journal(&bytes)?;
         Ok(Self {
             bytes,
-            module_sha256,
+            binding,
             explicit_snapshot: true,
         })
+    }
+
+    /// Exact workload identity supplied to the attested capture operation.
+    #[must_use]
+    pub const fn binding(&self) -> &WasixCheckpointBinding {
+        &self.binding
     }
 
     /// Size of the captured journal prefix.
@@ -206,6 +212,24 @@ impl WasixCheckpointCodec {
 
     /// Seal trusted, locally produced journal bytes into a versioned artifact.
     ///
+    /// The artifact inherits its complete workload identity from the attested
+    /// capture, so callers cannot relabel a capture during sealing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid capture binding, an empty journal, a
+    /// configured zero limit, an oversized journal, or an encoding failure.
+    pub fn seal_capture(&self, journal: &CapturedWasixJournal) -> Result<Vec<u8>> {
+        self.seal_bound_capture(&journal.binding, journal)
+    }
+
+    /// Seal a trusted capture after checking an expected workload identity.
+    ///
+    /// Prefer [`Self::seal_capture`] when the caller does not independently
+    /// need to assert an expected binding. This compatibility API rejects any
+    /// difference between `binding` and the complete identity recorded during
+    /// capture, including environment, command, instance, and generation.
+    ///
     /// # Errors
     ///
     /// Returns an error for an invalid binding, an empty journal, a configured
@@ -215,9 +239,23 @@ impl WasixCheckpointCodec {
         binding: &WasixCheckpointBinding,
         journal: &CapturedWasixJournal,
     ) -> Result<Vec<u8>> {
+        binding.validate()?;
+        if binding != &journal.binding {
+            return Err(Error::Checkpoint(
+                "captured journal binding does not match the checkpoint binding".to_owned(),
+            ));
+        }
+        self.seal_bound_capture(binding, journal)
+    }
+
+    fn seal_bound_capture(
+        &self,
+        binding: &WasixCheckpointBinding,
+        journal: &CapturedWasixJournal,
+    ) -> Result<Vec<u8>> {
         self.validate_limit()?;
         binding.validate()?;
-        if journal.module_sha256 != binding.module_sha256 || !journal.explicit_snapshot {
+        if binding != &journal.binding || !journal.explicit_snapshot {
             return Err(Error::Checkpoint(
                 "captured journal does not match the checkpoint binding".to_owned(),
             ));
@@ -645,9 +683,10 @@ mod tests {
         let codec = codec();
         let binding = binding();
         let captured = captured(valid_journal());
-        let first = codec.seal(&binding, &captured).unwrap();
-        let second = codec.seal(&binding, &captured).unwrap();
+        let first = codec.seal_capture(&captured).unwrap();
+        let second = codec.seal_capture(&captured).unwrap();
         assert_eq!(first, second);
+        assert_eq!(captured.binding(), &binding);
 
         let verified = codec.open(&binding, &first).unwrap();
         assert_eq!(verified.binding(), &binding);
@@ -666,10 +705,10 @@ mod tests {
         let codec = codec();
         let binding = binding();
         let mut wrong_module = captured(valid_journal());
-        wrong_module.module_sha256 = "3".repeat(64);
+        wrong_module.binding.module_sha256 = "3".repeat(64);
         assert!(matches!(
             codec.seal(&binding, &wrong_module),
-            Err(Error::Checkpoint(message)) if message == "captured journal does not match the checkpoint binding"
+            Err(Error::Checkpoint(message)) if message == "captured journal binding does not match the checkpoint binding"
         ));
 
         let mut implicit = captured(valid_journal());
@@ -678,6 +717,58 @@ mod tests {
             codec.seal(&binding, &implicit),
             Err(Error::Checkpoint(message)) if message == "captured journal does not match the checkpoint binding"
         ));
+    }
+
+    #[test]
+    fn refuses_to_relabel_a_capture_with_the_same_module() {
+        let codec = codec();
+        let binding = binding();
+        let captured = captured(valid_journal());
+        let relabeled = [
+            WasixCheckpointBinding::new(
+                format!("sha256:{}", "3".repeat(64)),
+                binding.module_sha256(),
+                binding.command(),
+                binding.instance_id(),
+                binding.generation(),
+            )
+            .unwrap(),
+            WasixCheckpointBinding::new(
+                binding.environment_id(),
+                binding.module_sha256(),
+                "other-command",
+                binding.instance_id(),
+                binding.generation(),
+            )
+            .unwrap(),
+            WasixCheckpointBinding::new(
+                binding.environment_id(),
+                binding.module_sha256(),
+                binding.command(),
+                "instance-2",
+                binding.generation(),
+            )
+            .unwrap(),
+            WasixCheckpointBinding::new(
+                binding.environment_id(),
+                binding.module_sha256(),
+                binding.command(),
+                binding.instance_id(),
+                binding.generation() + 1,
+            )
+            .unwrap(),
+        ];
+
+        for relabeled_binding in relabeled {
+            assert!(matches!(
+                codec.seal(&relabeled_binding, &captured),
+                Err(Error::Checkpoint(message))
+                    if message == "captured journal binding does not match the checkpoint binding"
+            ));
+        }
+
+        let artifact = codec.seal_capture(&captured).unwrap();
+        assert_eq!(codec.open(&binding, &artifact).unwrap().binding(), &binding);
     }
 
     #[test]
@@ -922,47 +1013,47 @@ mod tests {
     #[test]
     fn constructs_only_a_canonical_attested_worker_capture() {
         let bytes = valid_journal();
-        let module_sha256 = binding().module_sha256;
-        let captured = CapturedWasixJournal::from_attested_worker_capture(
-            bytes.clone(),
-            module_sha256.clone(),
-        )
-        .unwrap();
+        let binding = binding();
+        let captured =
+            CapturedWasixJournal::from_attested_worker_capture(bytes.clone(), binding.clone())
+                .unwrap();
 
         assert_eq!(captured.bytes, bytes);
-        assert_eq!(captured.module_sha256, module_sha256);
+        assert_eq!(captured.binding, binding);
         assert!(captured.explicit_snapshot);
     }
 
     #[test]
     fn rejects_malformed_or_noncanonical_attested_worker_capture() {
-        let module_sha256 = binding().module_sha256;
+        let binding = binding();
         let mut malformed = valid_journal();
         push_record(&mut malformed, 60, &[]);
         assert!(matches!(
             CapturedWasixJournal::from_attested_worker_capture(
                 malformed,
-                module_sha256.clone(),
+                binding.clone(),
             ),
             Err(Error::Checkpoint(message))
                 if message == "checkpoint journal contains records after its snapshot"
         ));
 
+        let mut noncanonical = binding;
+        noncanonical.module_sha256.replace_range(..1, "A");
         assert!(matches!(
             CapturedWasixJournal::from_attested_worker_capture(
                 valid_journal(),
-                format!("A{}", &module_sha256[1..]),
+                noncanonical,
             ),
             Err(Error::Checkpoint(message))
                 if message
-                    == "captured journal module digest must be 64 lowercase hexadecimal characters"
+                    == "checkpoint module digest must be 64 lowercase hexadecimal characters"
         ));
     }
 
     fn captured(bytes: Vec<u8>) -> CapturedWasixJournal {
         CapturedWasixJournal {
             bytes,
-            module_sha256: binding().module_sha256,
+            binding: binding(),
             explicit_snapshot: true,
         }
     }
