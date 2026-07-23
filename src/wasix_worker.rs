@@ -1685,7 +1685,7 @@ async fn perform_checkpoint_capture(
         .map_err(|_| Error::Timeout)??;
     let journal = CapturedWasixJournal::from_attested_worker_capture(
         journal,
-        acknowledgement.module_sha256.clone(),
+        input.expected.binding.clone(),
     )?;
     Ok(WasixCheckpointCapture {
         worker: metadata,

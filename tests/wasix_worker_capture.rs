@@ -42,8 +42,51 @@ async fn captures_a_real_checkpoint_in_a_fresh_worker() {
     assert_eq!(capture.worker.isolation.capability_masks, [0; 4]);
 
     let codec = WasixCheckpointCodec::new(CheckpointAuthenticationKey::new([7; 32]));
+    let relabeled = [
+        WasixCheckpointBinding::new(
+            format!("sha256:{}", "2".repeat(64)),
+            binding.module_sha256(),
+            binding.command(),
+            binding.instance_id(),
+            binding.generation(),
+        )
+        .expect("environment relabel must be canonical"),
+        WasixCheckpointBinding::new(
+            binding.environment_id(),
+            binding.module_sha256(),
+            "other-command",
+            binding.instance_id(),
+            binding.generation(),
+        )
+        .expect("command relabel must be canonical"),
+        WasixCheckpointBinding::new(
+            binding.environment_id(),
+            binding.module_sha256(),
+            binding.command(),
+            "other-instance",
+            binding.generation(),
+        )
+        .expect("instance relabel must be canonical"),
+        WasixCheckpointBinding::new(
+            binding.environment_id(),
+            binding.module_sha256(),
+            binding.command(),
+            binding.instance_id(),
+            binding.generation() + 1,
+        )
+        .expect("generation relabel must be canonical"),
+    ];
+    for relabeled_binding in relabeled {
+        let error = codec
+            .seal(&relabeled_binding, capture.journal())
+            .expect_err("an attested capture must not be relabeled during sealing");
+        assert!(
+            matches!(error, Error::Checkpoint(message) if message == "captured journal binding does not match the checkpoint binding")
+        );
+    }
+
     let artifact = codec
-        .seal(&binding, capture.journal())
+        .seal_capture(capture.journal())
         .expect("trusted worker capture must seal");
     let verified = codec
         .open(&binding, &artifact)

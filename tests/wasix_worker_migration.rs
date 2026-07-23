@@ -42,7 +42,7 @@ async fn moves_a_checkpoint_from_one_worker_to_another() {
     let journal_sha256 = source.journal_sha256.clone();
     let codec = WasixCheckpointCodec::new(CheckpointAuthenticationKey::new([7; 32]));
     let artifact = codec
-        .seal(&binding, source.journal())
+        .seal_capture(source.journal())
         .expect("source checkpoint must seal for transport");
     let checkpoint = codec
         .open(&binding, &artifact)
