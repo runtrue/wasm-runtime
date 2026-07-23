@@ -87,6 +87,31 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: scripts/package-consumer-smoke.sh
 
+  checkpoint-migration:
+    name: WASIX checkpoint migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40
+
+      - name: Restore WASIX checkpoint build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+          cache-bin: false
+          save-if: ${{ github.event_name != 'pull_request' }}
+          shared-key: ci-wasix-checkpoint
+
+      - name: Snapshot on source worker and restore on destination worker
+        run: >-
+          cargo test --locked --all-features
+          --test wasix_worker_migration --
+          --exact moves_a_checkpoint_from_one_worker_to_another
+
   supply-chain:
     name: Dependency policy and advisories
     runs-on: ubuntu-latest

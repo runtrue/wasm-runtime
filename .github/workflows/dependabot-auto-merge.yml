@@ -68,6 +68,7 @@ jobs:
         run: |
           required_checks=(
             "Rust quality and package"
+            "WASIX checkpoint migration"
             "Dependency policy and advisories"
             "Reproducible WASI fixtures"
           )
