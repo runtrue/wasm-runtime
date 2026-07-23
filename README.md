@@ -56,7 +56,13 @@ containment; deployments requiring those controls must configure the policy.
 `restore_wasix_checkpoint` accepts an authenticated checkpoint and its exact
 module, starts a fresh isolated destination worker, and resumes without any
 destination arguments. Restored arguments and process state come only from the
-checkpoint journal.
+checkpoint journal. The destination waits for native WASIX thread-pool work to
+quiesce and tears down its task runtime before returning independently bounded
+guest stdout and stderr. Worker-process diagnostics are separately bounded and
+redacted from ordinary `Display` and `Debug` error formatting; callers must
+explicitly access them from a structured checkpoint restore failure. When a
+failed worker exits before supervision terminates it, the same failure reports
+its portable exit code or Unix termination signal.
 
 `capture_wasix_checkpoint` starts a fresh isolated source worker with bounded
 arguments and environment, stops at an explicit WASIX snapshot, and returns a

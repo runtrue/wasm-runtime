@@ -1,5 +1,8 @@
 #[cfg(feature = "wasix-checkpoint")]
-use crate::{CapturedWasixJournal, CommandInput};
+use crate::{
+    CapturedWasixJournal, CommandInput, WasixCheckpointRestoreFailure,
+    WasixCheckpointRestoreFailureReason, WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
+};
 use crate::{Error, Result, VerifiedWasixCheckpoint, WasixCheckpointBinding};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -29,7 +32,7 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 7;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 8;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
@@ -46,6 +49,8 @@ const WASIX_WORKER_MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 const WASIX_WORKER_MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(feature = "wasix-checkpoint")]
 const WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(feature = "wasix-checkpoint")]
+const WASIX_WORKER_MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 #[cfg(feature = "wasix-checkpoint")]
 const WASIX_WORKER_MAX_CAPTURE_REQUEST_BYTES: usize = 64 * 1024;
 #[cfg(feature = "wasix-checkpoint")]
@@ -66,7 +71,7 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 /// trusted, administrator-controlled path. Every operation pins and hashes one
 /// exact regular file with Linux `openat2`, then executes that descriptor with
 /// `execveat`; pathname replacement cannot select a different worker after
-/// validation. Version 7 of the worker process boundary is supported on Linux
+/// validation. Version 8 of the worker process boundary is supported on Linux
 /// 5.6 or newer only.
 #[derive(Clone)]
 pub struct WasixWorkerConfig {
@@ -603,7 +608,7 @@ pub struct WasixCheckpointTransportMetadata {
 
 /// Result of restoring an authenticated checkpoint in a fresh isolated worker.
 #[cfg(feature = "wasix-checkpoint")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WasixCheckpointRestoreMetadata {
     /// Compatibility and isolation state of the destination worker.
     pub worker: WasixWorkerMetadata,
@@ -611,10 +616,30 @@ pub struct WasixCheckpointRestoreMetadata {
     pub binding: WasixCheckpointBinding,
     /// Bounded standard output emitted after the checkpoint resumed.
     pub stdout: Vec<u8>,
+    /// Bounded standard error emitted by the restored guest.
+    pub stderr: Vec<u8>,
+    /// Bounded diagnostics emitted by the worker process, normally empty.
+    pub worker_diagnostics: WasixWorkerDiagnostics,
     /// Lowercase SHA-256 digest of the restored module.
     pub module_sha256: String,
     /// Lowercase SHA-256 digest of the restored journal.
     pub journal_sha256: String,
+}
+
+#[cfg(feature = "wasix-checkpoint")]
+impl std::fmt::Debug for WasixCheckpointRestoreMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasixCheckpointRestoreMetadata")
+            .field("worker", &self.worker)
+            .field("binding", &self.binding)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("worker_diagnostics", &self.worker_diagnostics)
+            .field("module_sha256", &self.module_sha256)
+            .field("journal_sha256", &self.journal_sha256)
+            .finish()
+    }
 }
 
 /// Trusted journal capture produced by a fresh isolated source worker.
@@ -684,6 +709,8 @@ struct WasixCheckpointRestoreCompletion {
     exit_code: i32,
     stdout_bytes: u64,
     stdout_sha256: String,
+    stderr_bytes: u64,
+    stderr_sha256: String,
 }
 
 #[cfg(feature = "wasix-checkpoint")]
@@ -752,13 +779,14 @@ impl WasixCheckpointRestoreAck {
 
 #[cfg(feature = "wasix-checkpoint")]
 impl WasixCheckpointRestoreCompletion {
-    fn validate(&self, stdout: &[u8]) -> Result<()> {
-        let stdout_bytes = u64::try_from(stdout.len())
-            .map_err(|_| Error::Execution("WASIX worker output length overflows u64".to_owned()))?;
-        let stdout_sha256 = hex::encode(Sha256::digest(stdout));
+    fn validate(&self, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+        let matches = |bytes: &[u8], expected_bytes: u64, expected_sha256: &str| {
+            u64::try_from(bytes.len()).ok() == Some(expected_bytes)
+                && hex::encode(Sha256::digest(bytes)) == expected_sha256
+        };
         if self.exit_code != 0
-            || self.stdout_bytes != stdout_bytes
-            || self.stdout_sha256 != stdout_sha256
+            || !matches(stdout, self.stdout_bytes, &self.stdout_sha256)
+            || !matches(stderr, self.stderr_bytes, &self.stderr_sha256)
         {
             return Err(Error::Execution(
                 "WASIX worker restore completion did not match its output".to_owned(),
@@ -1300,7 +1328,7 @@ async fn restore_wasix_checkpoint_linux(
         .current_dir("/")
         .stdin(child_control)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut worker = spawn_wasix_worker(
         config,
@@ -1314,6 +1342,9 @@ async fn restore_wasix_checkpoint_linux(
         worker.child.stdout.take().ok_or_else(|| {
             Error::Execution("WASIX restore worker stdout was not piped".to_owned())
         })?;
+    let stderr = worker.child.stderr.take().ok_or_else(|| {
+        Error::Execution("WASIX restore worker diagnostics were not piped".to_owned())
+    })?;
     let expected = ExpectedCheckpointRestore {
         binding,
         module_bytes: prepared_module.bytes,
@@ -1331,6 +1362,7 @@ async fn restore_wasix_checkpoint_linux(
     let supervisor = tokio::spawn(supervise_checkpoint_restore(
         worker,
         stdout,
+        stderr,
         remaining,
         config.allowed_supplementary_groups.clone(),
         input,
@@ -1846,11 +1878,13 @@ async fn perform_checkpoint_transport(
 async fn supervise_checkpoint_restore(
     mut worker: WorkerProcess,
     mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
     handshake_timeout: Duration,
     allowed_supplementary_groups: Vec<u32>,
     mut input: CheckpointRestoreInput,
     mut cancelled: oneshot::Receiver<()>,
 ) -> Result<WasixCheckpointRestoreMetadata> {
+    let diagnostics = tokio::spawn(async move { read_worker_diagnostics(&mut stderr).await });
     let process_id = worker.process_id;
     let outcome = tokio::select! {
         biased;
@@ -1865,15 +1899,119 @@ async fn supervise_checkpoint_restore(
                 &mut input,
             ),
         ) => match result {
-            Ok(result) => result,
+            Ok(result) => result.map_err(|failure| {
+                Error::CheckpointRestore(WasixCheckpointRestoreFailure::new(
+                    failure.phase,
+                    failure.reason,
+                    WasixWorkerDiagnostics::new(Vec::new(), false),
+                ))
+            }),
             Err(_) => Err(Error::Timeout),
         },
     };
+
+    let mut observed_exit_status = None;
     if outcome.is_err() && worker.active {
         drop(stdout);
-        spawn_worker_reaper(worker);
+        observed_exit_status = observe_failed_restore_worker_exit(&mut worker).await;
+        worker.kill_tree();
+        if observed_exit_status.is_none() {
+            let _ = worker.child.start_kill();
+            let _ = worker.child.wait().await;
+        }
+        worker.disarm();
     }
-    outcome
+    let diagnostics = match diagnostics.await {
+        Ok(Ok(diagnostics)) => diagnostics,
+        Ok(Err(_)) | Err(_) => WasixWorkerDiagnostics::new(Vec::new(), true),
+    };
+    match outcome {
+        Ok(mut metadata) => {
+            metadata.worker_diagnostics = diagnostics;
+            Ok(metadata)
+        }
+        Err(Error::CheckpointRestore(failure)) => {
+            let failure =
+                WasixCheckpointRestoreFailure::new(failure.phase(), failure.reason(), diagnostics);
+            let failure = if let Some(status) = observed_exit_status {
+                let (exit_code, exit_signal) = worker_exit_status_parts(status);
+                failure.with_exit_status(exit_code, exit_signal)
+            } else {
+                failure
+            };
+            Err(Error::CheckpointRestore(failure))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn observe_failed_restore_worker_exit(
+    worker: &mut WorkerProcess,
+) -> Option<std::process::ExitStatus> {
+    if let Ok(Some(status)) = worker.child.try_wait() {
+        return Some(status);
+    }
+    tokio::time::timeout(Duration::from_millis(100), worker.child.wait())
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn worker_exit_status_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
+    use std::os::unix::process::ExitStatusExt as _;
+    (status.code(), status.signal())
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct RestoreOperationFailure {
+    phase: WasixCheckpointRestorePhase,
+    reason: WasixCheckpointRestoreFailureReason,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+impl RestoreOperationFailure {
+    const fn new(
+        phase: WasixCheckpointRestorePhase,
+        reason: WasixCheckpointRestoreFailureReason,
+    ) -> Self {
+        Self { phase, reason }
+    }
+
+    const fn protocol(phase: WasixCheckpointRestorePhase) -> Self {
+        Self::new(phase, WasixCheckpointRestoreFailureReason::Protocol)
+    }
+
+    const fn runtime() -> Self {
+        Self::new(
+            WasixCheckpointRestorePhase::Execution,
+            WasixCheckpointRestoreFailureReason::Runtime,
+        )
+    }
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn read_worker_diagnostics(
+    stderr: &mut (impl AsyncRead + Unpin),
+) -> std::io::Result<WasixWorkerDiagnostics> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(WASIX_WORKER_MAX_DIAGNOSTIC_BYTES)
+        .map_err(|error| std::io::Error::other(format!("diagnostic allocation failed: {error}")))?;
+    let mut truncated = false;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stderr.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = WASIX_WORKER_MAX_DIAGNOSTIC_BYTES.saturating_sub(bytes.len());
+        let retained = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained != read;
+    }
+    Ok(WasixWorkerDiagnostics::new(bytes, truncated))
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -1883,71 +2021,116 @@ async fn perform_checkpoint_restore(
     process_id: u32,
     allowed_supplementary_groups: &[u32],
     input: &mut CheckpointRestoreInput,
-) -> Result<WasixCheckpointRestoreMetadata> {
-    use tokio::io::AsyncWriteExt as _;
-
-    let ready = read_frame(stdout).await?;
-    let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready)
-        .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
-    metadata.validate(
+) -> std::result::Result<WasixCheckpointRestoreMetadata, RestoreOperationFailure> {
+    let (metadata, acknowledgement) = prepare_checkpoint_restore(
+        stdout,
         process_id,
         &worker.worker_build_sha256,
         allowed_supplementary_groups,
-    )?;
-
-    let control = input
-        .control
-        .as_mut()
-        .ok_or_else(|| Error::Execution("restore control socket is unavailable".to_owned()))?;
-    let module = input
-        .module
-        .as_ref()
-        .ok_or_else(|| Error::Execution("sealed restore module is unavailable".to_owned()))?;
-    send_checkpoint_descriptor(control, module, b'M').await?;
-    let journal = input
-        .journal
-        .as_ref()
-        .ok_or_else(|| Error::Execution("sealed restore journal is unavailable".to_owned()))?;
-    send_checkpoint_descriptor(control, journal, b'C').await?;
-
-    let frame = read_frame(stdout).await?;
-    let acknowledgement: WasixCheckpointRestoreAck =
-        serde_json::from_slice(&frame).map_err(|error| {
-            Error::Execution(format!("invalid WASIX restore acknowledgement: {error}"))
-        })?;
-    acknowledgement.validate(
-        input.expected.module_bytes,
-        &input.expected.module_sha256,
-        input.expected.journal_bytes,
-        &input.expected.journal_sha256,
-    )?;
-
-    control
-        .write_all(b"E")
-        .await
-        .map_err(|error| Error::Execution(format!("failed to authorize WASIX restore: {error}")))?;
-    control.shutdown().await.map_err(|error| {
-        Error::Execution(format!(
-            "failed to finish WASIX restore authorization: {error}"
-        ))
-    })?;
+        input,
+    )
+    .await?;
     input.control.take();
     input.module.take();
     input.journal.take();
-
-    let frame = read_frame(stdout).await?;
-    let completion: WasixCheckpointRestoreCompletion = serde_json::from_slice(&frame)
-        .map_err(|error| Error::Execution(format!("invalid WASIX restore completion: {error}")))?;
-    let restored_stdout = read_output_frame(stdout).await?;
-    completion.validate(&restored_stdout)?;
-    finish_worker_output(worker, stdout, "checkpoint restore").await?;
+    let (restored_stdout, restored_stderr) = collect_checkpoint_restore_output(stdout).await?;
+    finish_worker_output(worker, stdout, "checkpoint restore")
+        .await
+        .map_err(|_| {
+            RestoreOperationFailure::new(
+                WasixCheckpointRestorePhase::Shutdown,
+                WasixCheckpointRestoreFailureReason::WorkerProcess,
+            )
+        })?;
     Ok(WasixCheckpointRestoreMetadata {
         worker: metadata,
         binding: input.expected.binding.clone(),
         stdout: restored_stdout,
+        stderr: restored_stderr,
+        worker_diagnostics: WasixWorkerDiagnostics::new(Vec::new(), false),
         module_sha256: acknowledgement.module_sha256,
         journal_sha256: acknowledgement.journal_sha256,
     })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn prepare_checkpoint_restore(
+    stdout: &mut tokio::process::ChildStdout,
+    process_id: u32,
+    expected_worker_build_sha256: &str,
+    allowed_supplementary_groups: &[u32],
+    input: &mut CheckpointRestoreInput,
+) -> std::result::Result<(WasixWorkerMetadata, WasixCheckpointRestoreAck), RestoreOperationFailure>
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let ready_failure = || RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Ready);
+    let ready = read_frame(stdout).await.map_err(|_| ready_failure())?;
+    let metadata: WasixWorkerMetadata =
+        serde_json::from_slice(&ready).map_err(|_| ready_failure())?;
+    metadata
+        .validate(
+            process_id,
+            expected_worker_build_sha256,
+            allowed_supplementary_groups,
+        )
+        .map_err(|_| ready_failure())?;
+
+    let input_failure = || RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Input);
+    let control = input.control.as_mut().ok_or_else(input_failure)?;
+    let module = input.module.as_ref().ok_or_else(input_failure)?;
+    send_checkpoint_descriptor(control, module, b'M')
+        .await
+        .map_err(|_| input_failure())?;
+    let journal = input.journal.as_ref().ok_or_else(input_failure)?;
+    send_checkpoint_descriptor(control, journal, b'C')
+        .await
+        .map_err(|_| input_failure())?;
+    let frame = read_frame(stdout).await.map_err(|_| input_failure())?;
+    let acknowledgement: WasixCheckpointRestoreAck =
+        serde_json::from_slice(&frame).map_err(|_| input_failure())?;
+    acknowledgement
+        .validate(
+            input.expected.module_bytes,
+            &input.expected.module_sha256,
+            input.expected.journal_bytes,
+            &input.expected.journal_sha256,
+        )
+        .map_err(|_| input_failure())?;
+
+    let authorization_failure =
+        || RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Authorization);
+    control
+        .write_all(b"E")
+        .await
+        .map_err(|_| authorization_failure())?;
+    control
+        .shutdown()
+        .await
+        .map_err(|_| authorization_failure())?;
+    Ok((metadata, acknowledgement))
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+async fn collect_checkpoint_restore_output(
+    stdout: &mut tokio::process::ChildStdout,
+) -> std::result::Result<(Vec<u8>, Vec<u8>), RestoreOperationFailure> {
+    let frame = read_frame(stdout)
+        .await
+        .map_err(|_| RestoreOperationFailure::runtime())?;
+    let completion: WasixCheckpointRestoreCompletion = serde_json::from_slice(&frame)
+        .map_err(|_| RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Execution))?;
+    let output_failure = || RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Output);
+    let restored_stdout = read_restore_output_frame(stdout, "stdout")
+        .await
+        .map_err(|_| output_failure())?;
+    let restored_stderr = read_restore_output_frame(stdout, "stderr")
+        .await
+        .map_err(|_| output_failure())?;
+    completion
+        .validate(&restored_stdout, &restored_stderr)
+        .map_err(|_| RestoreOperationFailure::protocol(WasixCheckpointRestorePhase::Output))?;
+    Ok((restored_stdout, restored_stderr))
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -2452,12 +2635,15 @@ async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
 }
 
 #[cfg(feature = "wasix-checkpoint")]
-async fn read_output_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
+async fn read_restore_output_frame(
+    reader: &mut (impl AsyncRead + Unpin),
+    stream: &str,
+) -> Result<Vec<u8>> {
     read_bounded_worker_frame(
         reader,
         WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
         true,
-        "restore output",
+        &format!("restore {stream}"),
     )
     .await
 }
@@ -2781,7 +2967,7 @@ fn current_worker_build_sha256() -> std::result::Result<String, String> {
     Err("WASIX worker build identity requires Linux".to_owned())
 }
 
-/// Enter the worker isolation profile and write one version 7 ready frame.
+/// Enter the worker isolation profile and write one version 8 ready frame.
 ///
 /// This function must be called from the worker's initial thread before a
 /// Tokio runtime is created and before any guest-controlled bytes are read.
@@ -2960,18 +3146,21 @@ pub fn write_wasix_checkpoint_restore(
         .map_err(|error| format!("cannot clear restore worker stdin: {error}"))?;
     drop(reader);
 
-    let (exit_code, stdout) =
-        execute_wasix_checkpoint_restore(&module, module_metadata.bytes, journal)?;
+    let restored = execute_wasix_checkpoint_restore(&module, module_metadata.bytes, journal)?;
     let completion = WasixCheckpointRestoreCompletion {
-        exit_code,
-        stdout_bytes: u64::try_from(stdout.len())
+        exit_code: restored.exit_code,
+        stdout_bytes: u64::try_from(restored.stdout.len())
             .map_err(|_| "restore output length overflows u64".to_owned())?,
-        stdout_sha256: hex::encode(Sha256::digest(&stdout)),
+        stdout_sha256: hex::encode(Sha256::digest(&restored.stdout)),
+        stderr_bytes: u64::try_from(restored.stderr.len())
+            .map_err(|_| "restore error output length overflows u64".to_owned())?,
+        stderr_sha256: hex::encode(Sha256::digest(&restored.stderr)),
     };
     let frame = serde_json::to_vec(&completion)
         .map_err(|error| format!("cannot encode restore completion: {error}"))?;
     write_worker_frame(&mut writer, &frame)?;
-    write_worker_output_frame(&mut writer, &stdout)
+    write_worker_output_frame(&mut writer, &restored.stdout, "restore stdout")?;
+    write_worker_output_frame(&mut writer, &restored.stderr, "restore stderr")
 }
 
 /// Capture one explicit WASIX snapshot in an isolated source worker.
@@ -3044,8 +3233,8 @@ pub fn write_wasix_checkpoint_capture(
         false,
         "capture journal",
     )?;
-    write_worker_output_frame(&mut writer, &captured.stdout)?;
-    write_worker_output_frame(&mut writer, &captured.stderr)
+    write_worker_output_frame(&mut writer, &captured.stdout, "capture stdout")?;
+    write_worker_output_frame(&mut writer, &captured.stderr, "capture stderr")
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -3119,7 +3308,7 @@ fn execute_wasix_checkpoint_restore(
     module: &std::os::fd::OwnedFd,
     module_length: u64,
     journal: std::os::fd::OwnedFd,
-) -> std::result::Result<(i32, Vec<u8>), String> {
+) -> std::result::Result<ExecutedCheckpointRestore, String> {
     use crate::wasix_output::BoundedWasixOutput;
     use std::sync::Arc;
     use wasmer::Module;
@@ -3150,9 +3339,9 @@ fn execute_wasix_checkpoint_restore(
         .build()
         .map_err(|error| format!("cannot initialize WASIX restore runtime: {error}"))?;
     let runtime_handle = tokio_runtime.handle().clone();
-    let _runtime_guard = runtime_handle.enter();
+    let runtime_guard = runtime_handle.enter();
     let task_manager = Arc::new(TokioTaskManager::new(runtime_handle.clone()));
-    let mut concrete_runtime = PluggableRuntime::new(task_manager);
+    let mut concrete_runtime = PluggableRuntime::new(task_manager.clone());
     concrete_runtime.set_engine(engine);
     concrete_runtime.set_networking_implementation(UnsupportedVirtualNetworking::default());
     concrete_runtime.http_client = None;
@@ -3162,10 +3351,13 @@ fn execute_wasix_checkpoint_restore(
 
     let stdout = BoundedWasixOutput::new(WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES)
         .map_err(|error| format!("cannot allocate bounded restore output: {error}"))?;
+    let stderr = BoundedWasixOutput::new(WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES)
+        .map_err(|error| format!("cannot allocate bounded restore error output: {error}"))?;
     let mut builder = WasiEnvBuilder::new("restored-checkpoint");
     builder.set_runtime(runtime.clone());
     builder.set_module_hash(module_hash);
     builder.set_stdout(Box::new(stdout.clone()));
+    builder.set_stderr(Box::new(stderr.clone()));
     builder.with_skip_stdio_during_bootstrap(true);
     let environment = builder
         .build()
@@ -3180,10 +3372,35 @@ fn execute_wasix_checkpoint_restore(
     if !exit_code.is_success() {
         return Err(format!("restored WASIX process exited with {exit_code}"));
     }
-    let output = stdout
+    quiesce_wasix_task_manager(&task_manager);
+    drop(runtime);
+    drop(runtime_guard);
+    drop(tokio_runtime);
+    let captured_stdout = stdout
         .finish()
         .map_err(|error| format!("cannot finish bounded restore output: {error}"))?;
-    Ok((exit_code.raw(), output))
+    let captured_stderr = stderr
+        .finish()
+        .map_err(|error| format!("cannot finish bounded restore error output: {error}"))?;
+    Ok(ExecutedCheckpointRestore {
+        exit_code: exit_code.raw(),
+        stdout: captured_stdout,
+        stderr: captured_stderr,
+    })
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+struct ExecutedCheckpointRestore {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+fn quiesce_wasix_task_manager(
+    task_manager: &std::sync::Arc<wasmer_wasix::runtime::task_manager::tokio::TokioTaskManager>,
+) {
+    task_manager.pool_handle().join();
 }
 
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
@@ -3523,13 +3740,14 @@ fn write_worker_frame(writer: &mut impl Write, frame: &[u8]) -> std::result::Res
 fn write_worker_output_frame(
     writer: &mut impl Write,
     frame: &[u8],
+    label: &str,
 ) -> std::result::Result<(), String> {
     write_worker_bounded_frame(
         writer,
         frame,
         WASIX_WORKER_MAX_RESTORE_OUTPUT_BYTES,
         true,
-        "restore output",
+        label,
     )
 }
 
@@ -3557,6 +3775,116 @@ fn write_worker_bounded_frame(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    #[test]
+    fn restore_quiescence_waits_for_background_thread_pool_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wasmer_wasix::runtime::task_manager::{
+            VirtualTaskManager as _, tokio::TokioTaskManager,
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        let task_manager = std::sync::Arc::new(TokioTaskManager::new(runtime.handle().clone()));
+        let completed = std::sync::Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+        task_manager
+            .task_dedicated(Box::new(move || {
+                std::thread::sleep(Duration::from_millis(25));
+                task_completed.store(true, Ordering::Release);
+            }))
+            .expect("background work must spawn");
+
+        quiesce_wasix_task_manager(&task_manager);
+
+        assert!(
+            completed.load(Ordering::Acquire),
+            "quiescence must wait for native WASIX task-pool work"
+        );
+    }
+
+    #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
+    #[tokio::test]
+    async fn premature_restore_worker_eof_reports_phase_status_and_diagnostics() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'premature restore EOF diagnostic' >&2; exit 17")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().expect("test restore worker must spawn");
+        let mut worker =
+            WorkerProcess::new(child, "0".repeat(64)).expect("test worker must expose its pid");
+        let stdout = worker
+            .child
+            .stdout
+            .take()
+            .expect("test worker stdout must be piped");
+        let stderr = worker
+            .child
+            .stderr
+            .take()
+            .expect("test worker stderr must be piped");
+        let binding = WasixCheckpointBinding::new(
+            format!("sha256:{}", "1".repeat(64)),
+            "2".repeat(64),
+            "_start",
+            "premature-eof-test",
+            1,
+        )
+        .expect("test binding must be valid");
+        let input = CheckpointRestoreInput {
+            control: None,
+            module: None,
+            journal: None,
+            expected: ExpectedCheckpointRestore {
+                binding,
+                module_bytes: 1,
+                module_sha256: "2".repeat(64),
+                journal_bytes: 1,
+                journal_sha256: "3".repeat(64),
+            },
+        };
+        let (_cancel, cancelled) = oneshot::channel();
+
+        let error = supervise_checkpoint_restore(
+            worker,
+            stdout,
+            stderr,
+            Duration::from_secs(5),
+            Vec::new(),
+            input,
+            cancelled,
+        )
+        .await
+        .expect_err("premature worker EOF must fail the restore");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let Error::CheckpointRestore(failure) = error else {
+            panic!("premature EOF must be a structured restore failure: {error:?}");
+        };
+
+        assert_eq!(failure.phase(), WasixCheckpointRestorePhase::Ready);
+        assert_eq!(
+            failure.reason(),
+            WasixCheckpointRestoreFailureReason::Protocol
+        );
+        assert_eq!(failure.exit_code(), Some(17));
+        assert_eq!(failure.exit_signal(), None);
+        assert_eq!(
+            failure.diagnostics().as_bytes(),
+            b"premature restore EOF diagnostic"
+        );
+        assert!(!display.contains("premature restore EOF diagnostic"));
+        assert!(!debug.contains("premature restore EOF diagnostic"));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -3718,5 +4046,31 @@ mod tests {
                 Err(Error::Execution(_))
             ));
         }
+    }
+
+    #[cfg(feature = "wasix-checkpoint")]
+    #[tokio::test]
+    async fn worker_diagnostics_are_bounded_and_report_truncation() {
+        let (mut writer, mut reader) = tokio::io::duplex(WASIX_WORKER_MAX_DIAGNOSTIC_BYTES * 2);
+        let emitted = vec![b'x'; WASIX_WORKER_MAX_DIAGNOSTIC_BYTES + 1];
+        let write = tokio::spawn(async move {
+            writer
+                .write_all(&emitted)
+                .await
+                .expect("test diagnostics must be writable");
+            writer
+                .shutdown()
+                .await
+                .expect("test diagnostics must reach EOF");
+        });
+
+        let diagnostics = read_worker_diagnostics(&mut reader)
+            .await
+            .expect("test diagnostics must be readable");
+        write.await.expect("diagnostic writer must be joinable");
+
+        assert_eq!(diagnostics.len(), WASIX_WORKER_MAX_DIAGNOSTIC_BYTES);
+        assert!(diagnostics.is_truncated());
+        assert!(diagnostics.as_bytes().iter().all(|byte| *byte == b'x'));
     }
 }
