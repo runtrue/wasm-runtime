@@ -35,7 +35,9 @@ rejected.
 
 The checkpoint feature does not relax the worker trust boundary: guest input
 is still withheld until the fresh worker reports the required compatibility
-and Linux isolation state.
+and Linux isolation state. On Linux 5.6 or newer, the host pins a trusted
+regular worker inode with `openat2`, executes that descriptor with `execveat`,
+and verifies the worker's self-reported executable SHA-256 before sending input.
 
 Every Linux worker arms `SIGKILL` as its parent-death signal before `exec` and
 checks for a parent-loss race, so a worker cannot continue when its immediate
@@ -64,6 +66,9 @@ supported by the capture path.
 To move the checkpoint, authenticate the captured journal with
 `WasixCheckpointCodec`, transfer the sealed artifact and exact module to the
 destination, reopen the artifact, and pass it to `restore_wasix_checkpoint`.
+Checkpoint format version 2 binds the artifact to the exact source worker
+executable; the destination must run the byte-identical worker build. Drain
+checkpoints before deploying a different worker binary.
 The integration suite proves this flow with a Rust/WASIX program that captures
 the argument `424242` in one worker and prints it after resuming in a different
 worker without destination arguments.

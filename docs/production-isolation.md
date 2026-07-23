@@ -32,15 +32,39 @@ inside this OS boundary. Neither layer replaces the other.
 
 ## WASIX worker startup
 
-Install the `runtrue-wasix-worker` executable at a root- or
-administrator-controlled, non-symlink path. Run it from a dedicated service
-account with no supplementary groups. A worker started with root
+Worker protocol version 7 requires Linux 5.6 or newer. Install the
+`runtrue-wasix-worker` executable as a nonempty regular file. The file and every
+directory in its configured absolute path must be owned by root or the host
+process's effective user ID. Neither the file nor an ancestor may be group- or
+world-writable; the file must also have no
+set-user-ID or set-group-ID bits. No configured path component may be a symlink.
+These checks intentionally reject workers reached through common writable
+directories such as `/tmp`. Additional hard links, if used by packaging, must
+remain under the same administrative control because they name the same inode.
+
+The parent resolves the path with Linux `openat2(NO_SYMLINKS | NO_MAGICLINKS)`,
+validates and SHA-256 hashes that open descriptor, and executes the same inode
+with `execveat(AT_EMPTY_PATH)`. Replacing or renaming the configured pathname
+after validation therefore cannot select another executable. Do not replace
+this descriptor-based launch with a second pathname lookup.
+
+Run the worker from a dedicated service account with no supplementary groups.
+A worker started with root
 credentials drops all real, effective, saved, and filesystem user and group
 IDs to numeric ID 65534 and clears supplementary groups before reporting
 Ready; an already unprivileged worker retains its deployment identity. The
 parent rejects all supplementary groups by default; deployments that genuinely
 require non-root groups must list the exact IDs with
 `with_allowed_supplementary_groups`.
+
+Before isolation, the worker hashes `/proc/self/exe`; its Ready frame reports
+that immutable build digest. The parent compares it with the digest computed
+from the pinned descriptor before accepting any guest input. Checkpoint format
+version 2 authenticates the same source-worker digest, and restore or transport
+fails closed unless the destination uses the byte-identical worker executable.
+Deploy worker upgrades only after draining or deliberately invalidating
+outstanding checkpoints. The runtime continues to reject this process boundary
+on non-Linux targets rather than falling back to pathname execution.
 
 For every execution, the parent must create the worker process group, attach
 the process to its per-invocation cgroup, validate the isolated Ready frame,

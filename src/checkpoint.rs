@@ -6,8 +6,8 @@ use sha2::{Digest as _, Sha256};
 type HmacSha256 = Hmac<Sha256>;
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"RTWCPKT\0";
-const CHECKPOINT_FORMAT_VERSION: u16 = 1;
-const CHECKPOINT_DOMAIN: &[u8] = b"runtrue-wasm-runtime.wasix-checkpoint.v1\0";
+const CHECKPOINT_FORMAT_VERSION: u16 = 2;
+const CHECKPOINT_DOMAIN: &[u8] = b"runtrue-wasm-runtime.wasix-checkpoint.v2\0";
 const CHECKPOINT_ENGINE_PROFILE: &str = "runtrue-wasix-engine-v1";
 const CHECKPOINT_JOURNAL_FORMAT: &str = "wasmer-log-file-v1";
 const CHECKPOINT_EXECUTION_ABI: &str = "wasix_32v1+asyncify";
@@ -145,6 +145,7 @@ pub struct WasixCheckpointCodec {
 pub struct CapturedWasixJournal {
     bytes: Vec<u8>,
     binding: WasixCheckpointBinding,
+    worker_build_sha256: String,
     explicit_snapshot: bool,
 }
 
@@ -154,6 +155,7 @@ impl std::fmt::Debug for CapturedWasixJournal {
             .debug_struct("CapturedWasixJournal")
             .field("bytes", &self.bytes.len())
             .field("binding", &self.binding)
+            .field("worker_build_sha256", &self.worker_build_sha256)
             .field("explicit_snapshot", &self.explicit_snapshot)
             .finish()
     }
@@ -164,12 +166,15 @@ impl CapturedWasixJournal {
     pub(crate) fn from_attested_worker_capture(
         bytes: Vec<u8>,
         binding: WasixCheckpointBinding,
+        worker_build_sha256: String,
     ) -> Result<Self> {
         binding.validate()?;
+        validate_sha256("captured worker build digest", &worker_build_sha256)?;
         scan_journal(&bytes)?;
         Ok(Self {
             bytes,
             binding,
+            worker_build_sha256,
             explicit_snapshot: true,
         })
     }
@@ -263,7 +268,11 @@ impl WasixCheckpointCodec {
         self.validate_journal_length(journal.bytes.len())?;
         scan_journal(&journal.bytes)?;
 
-        let metadata = CheckpointMetadata::current(binding.clone(), &journal.bytes);
+        let metadata = CheckpointMetadata::current(
+            binding.clone(),
+            &journal.worker_build_sha256,
+            &journal.bytes,
+        );
         let metadata = serde_json::to_vec(&metadata).map_err(|error| {
             Error::Checkpoint(format!("checkpoint metadata encoding failed: {error}"))
         })?;
@@ -399,6 +408,7 @@ impl WasixCheckpointCodec {
             binding: metadata.binding,
             journal: journal.to_vec(),
             artifact_sha256: hex::encode(Sha256::digest(artifact)),
+            worker_build_sha256: metadata.worker_build_sha256,
         })
     }
 
@@ -440,6 +450,7 @@ pub struct VerifiedWasixCheckpoint {
     binding: WasixCheckpointBinding,
     journal: Vec<u8>,
     artifact_sha256: String,
+    worker_build_sha256: String,
 }
 
 impl std::fmt::Debug for VerifiedWasixCheckpoint {
@@ -449,6 +460,7 @@ impl std::fmt::Debug for VerifiedWasixCheckpoint {
             .field("binding", &self.binding)
             .field("journal_bytes", &self.journal.len())
             .field("artifact_sha256", &self.artifact_sha256)
+            .field("worker_build_sha256", &self.worker_build_sha256)
             .finish()
     }
 }
@@ -472,8 +484,14 @@ impl VerifiedWasixCheckpoint {
         &self.artifact_sha256
     }
 
-    pub(crate) fn into_journal(self) -> Vec<u8> {
-        self.journal
+    /// Lowercase SHA-256 digest of the source worker executable.
+    #[must_use]
+    pub fn worker_build_sha256(&self) -> &str {
+        &self.worker_build_sha256
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, String) {
+        (self.journal, self.worker_build_sha256)
     }
 }
 
@@ -484,6 +502,7 @@ struct CheckpointMetadata {
     runtime_version: String,
     worker_protocol_version: u32,
     cohort_id: String,
+    worker_build_sha256: String,
     engine_profile: String,
     platform: String,
     journal_format: String,
@@ -494,12 +513,13 @@ struct CheckpointMetadata {
 }
 
 impl CheckpointMetadata {
-    fn current(binding: WasixCheckpointBinding, journal: &[u8]) -> Self {
+    fn current(binding: WasixCheckpointBinding, worker_build_sha256: &str, journal: &[u8]) -> Self {
         Self {
             binding,
             runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             worker_protocol_version: WASIX_WORKER_PROTOCOL_VERSION,
             cohort_id: WASIX_COHORT_ID.to_owned(),
+            worker_build_sha256: worker_build_sha256.to_owned(),
             engine_profile: CHECKPOINT_ENGINE_PROFILE.to_owned(),
             platform: checkpoint_platform(),
             journal_format: CHECKPOINT_JOURNAL_FORMAT.to_owned(),
@@ -513,7 +533,8 @@ impl CheckpointMetadata {
     fn validate(&self, expected_binding: &WasixCheckpointBinding) -> Result<()> {
         self.binding.validate()?;
         validate_sha256("checkpoint journal digest", &self.journal_sha256)?;
-        let expected = Self::current(expected_binding.clone(), &[]);
+        validate_sha256("checkpoint worker build digest", &self.worker_build_sha256)?;
+        let expected = Self::current(expected_binding.clone(), &self.worker_build_sha256, &[]);
         if self.binding != expected.binding
             || self.runtime_version != expected.runtime_version
             || self.worker_protocol_version != expected.worker_protocol_version
@@ -796,7 +817,8 @@ mod tests {
         let codec = codec();
         let binding = binding();
         let journal = valid_journal();
-        let current = CheckpointMetadata::current(binding.clone(), &journal);
+        let current =
+            CheckpointMetadata::current(binding.clone(), &worker_build_sha256(), &journal);
         let mut mismatches = Vec::new();
 
         let mut metadata = current.clone();
@@ -842,8 +864,12 @@ mod tests {
         let codec = codec();
         let binding = binding();
         let journal = JOURNAL_MAGIC.to_vec();
-        let metadata =
-            serde_json::to_vec(&CheckpointMetadata::current(binding.clone(), &journal)).unwrap();
+        let metadata = serde_json::to_vec(&CheckpointMetadata::current(
+            binding.clone(),
+            &worker_build_sha256(),
+            &journal,
+        ))
+        .unwrap();
         let artifact = envelope(&codec, &metadata, &journal);
         let error = codec.open(&binding, &artifact).unwrap_err();
         assert!(
@@ -1014,9 +1040,12 @@ mod tests {
     fn constructs_only_a_canonical_attested_worker_capture() {
         let bytes = valid_journal();
         let binding = binding();
-        let captured =
-            CapturedWasixJournal::from_attested_worker_capture(bytes.clone(), binding.clone())
-                .unwrap();
+        let captured = CapturedWasixJournal::from_attested_worker_capture(
+            bytes.clone(),
+            binding.clone(),
+            worker_build_sha256(),
+        )
+        .unwrap();
 
         assert_eq!(captured.bytes, bytes);
         assert_eq!(captured.binding, binding);
@@ -1032,21 +1061,34 @@ mod tests {
             CapturedWasixJournal::from_attested_worker_capture(
                 malformed,
                 binding.clone(),
+                worker_build_sha256(),
             ),
             Err(Error::Checkpoint(message))
                 if message == "checkpoint journal contains records after its snapshot"
         ));
 
-        let mut noncanonical = binding;
+        let mut noncanonical = binding.clone();
         noncanonical.module_sha256.replace_range(..1, "A");
         assert!(matches!(
             CapturedWasixJournal::from_attested_worker_capture(
                 valid_journal(),
                 noncanonical,
+                worker_build_sha256(),
             ),
             Err(Error::Checkpoint(message))
                 if message
                     == "checkpoint module digest must be 64 lowercase hexadecimal characters"
+        ));
+
+        assert!(matches!(
+            CapturedWasixJournal::from_attested_worker_capture(
+                valid_journal(),
+                binding,
+                "not-a-worker-digest".to_owned(),
+            ),
+            Err(Error::Checkpoint(message))
+                if message
+                    == "captured worker build digest must be 64 lowercase hexadecimal characters"
         ));
     }
 
@@ -1054,8 +1096,13 @@ mod tests {
         CapturedWasixJournal {
             bytes,
             binding: binding(),
+            worker_build_sha256: worker_build_sha256(),
             explicit_snapshot: true,
         }
+    }
+
+    fn worker_build_sha256() -> String {
+        "4".repeat(64)
     }
 
     fn push_record(journal: &mut Vec<u8>, record_type: u16, body: &[u8]) {

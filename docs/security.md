@@ -52,13 +52,23 @@ metadata, or authentication key makes an entry incompatible.
   eviction.
 
 The optional WASIX backend is deployed as a separate Linux worker. Before a
-worker emits its Ready frame, it lowers its core-file and open-file limits,
+worker is launched, the parent opens its trusted absolute path without
+following symlinks, rejects unsafe ownership or write permissions on the file
+and its ancestors, hashes the open executable, and executes that same file
+descriptor. Before a worker emits its Ready frame, it hashes its own executable,
+lowers its core-file and open-file limits,
 removes root credentials and Linux capabilities, sets `no_new_privs`, and
 disables dumpability. It also closes inherited host file descriptors above
 standard error. The parent rejects a Ready frame that does not report every
-required postcondition or the deployment's exact supplementary-group
+required postcondition, the pinned executable's exact SHA-256 digest, or the
+deployment's exact supplementary-group
 allowlist. No guest request, module, package, or checkpoint may be sent before
 that validation succeeds.
+
+Authenticated checkpoint artifacts include the source worker's executable
+digest. A destination with any other worker build rejects the checkpoint before
+replay, in addition to the runtime, protocol, engine, ABI, platform, and module
+compatibility checks.
 
 This worker bootstrap is an inner hardening layer, not a complete tenant
 sandbox. In particular, rlimits do not provide reliable resident-memory,

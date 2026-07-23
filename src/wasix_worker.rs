@@ -4,6 +4,10 @@ use crate::{Error, Result, VerifiedWasixCheckpoint, WasixCheckpointBinding};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(all(feature = "wasix", target_os = "linux"))]
+use std::fs;
 #[cfg(all(feature = "wasix", not(target_os = "linux")))]
 use std::io::Read;
 #[cfg(any(feature = "wasix", target_os = "linux"))]
@@ -13,7 +17,6 @@ use std::io::{Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
-    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -26,7 +29,7 @@ use tokio::{
 };
 
 /// Worker protocol implemented by this runtime release.
-pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 6;
+pub const WASIX_WORKER_PROTOCOL_VERSION: u32 = 7;
 
 /// Exact engine and package cohort required for worker compatibility.
 pub const WASIX_COHORT_ID: &str = "wasmer-7.1.0+wasix-0.701.0+webc-11.0.0";
@@ -60,9 +63,11 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 /// Explicit deployment configuration for the out-of-process WASIX worker.
 ///
 /// The executable is a deployment trust anchor and must be installed at a
-/// trusted, administrator-controlled path. The protocol probe checks reported
-/// compatibility; it is not a signature over the executable. Version 6 of the
-/// worker process boundary is supported on Linux only.
+/// trusted, administrator-controlled path. Every operation pins and hashes one
+/// exact regular file with Linux `openat2`, then executes that descriptor with
+/// `execveat`; pathname replacement cannot select a different worker after
+/// validation. Version 7 of the worker process boundary is supported on Linux
+/// 5.6 or newer only.
 #[derive(Clone)]
 pub struct WasixWorkerConfig {
     executable: PathBuf,
@@ -234,7 +239,7 @@ impl WasixWorkerConfig {
         self.placement.is_some()
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate_common(&self) -> Result<()> {
         if !cfg!(target_os = "linux") {
             return Err(Error::Configuration(
                 "the WASIX worker process boundary currently requires Linux".to_owned(),
@@ -245,54 +250,6 @@ impl WasixWorkerConfig {
             return Err(Error::Configuration(
                 "WASIX worker executable must be an absolute path".to_owned(),
             ));
-        }
-        let metadata = fs::symlink_metadata(&self.executable).map_err(|error| {
-            Error::Configuration(format!(
-                "cannot inspect WASIX worker {}: {error}",
-                self.executable.display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(Error::Configuration(format!(
-                "WASIX worker must be a regular non-symlink file: {}",
-                self.executable.display()
-            )));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode();
-            if mode & 0o111 == 0 {
-                return Err(Error::Configuration(format!(
-                    "WASIX worker is not executable: {}",
-                    self.executable.display()
-                )));
-            }
-            if mode & 0o6000 != 0 {
-                return Err(Error::Configuration(format!(
-                    "WASIX worker must not be set-user-ID or set-group-ID: {}",
-                    self.executable.display()
-                )));
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let mut capabilities = [0_u8; 256];
-            match rustix::fs::getxattr(&self.executable, "security.capability", &mut capabilities) {
-                Ok(bytes) if bytes != 0 => {
-                    return Err(Error::Configuration(format!(
-                        "WASIX worker must not have file capabilities: {}",
-                        self.executable.display()
-                    )));
-                }
-                Ok(_) | Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => {}
-                Err(error) => {
-                    return Err(Error::Configuration(format!(
-                        "cannot inspect WASIX worker file capabilities for {}: {error}",
-                        self.executable.display()
-                    )));
-                }
-            }
         }
         if self.handshake_timeout.is_zero() || self.handshake_timeout > MAX_HANDSHAKE_TIMEOUT {
             return Err(Error::Configuration(
@@ -308,6 +265,254 @@ impl WasixWorkerConfig {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "linux")]
+    fn pin_executable(&self) -> Result<PinnedWorkerExecutable> {
+        self.validate_common()?;
+        PinnedWorkerExecutable::open(&self.executable)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PinnedWorkerExecutable {
+    descriptor: std::os::fd::OwnedFd,
+    path: PathBuf,
+    sha256: String,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedWorkerExecutable {
+    fn open(path: &Path) -> Result<Self> {
+        use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, fstat, openat2};
+
+        validate_worker_ancestors(path)?;
+        let descriptor = openat2(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .map_err(|error| {
+            Error::Configuration(format!(
+                "cannot pin WASIX worker {} with openat2: {error}",
+                path.display()
+            ))
+        })?;
+        let stat = fstat(&descriptor).map_err(|error| {
+            Error::Configuration(format!(
+                "cannot inspect pinned WASIX worker {}: {error}",
+                path.display()
+            ))
+        })?;
+        validate_worker_file_stat(path, &stat, FileType::from_raw_mode(stat.st_mode))?;
+        validate_worker_file_capabilities(path, &descriptor)?;
+        let bytes = u64::try_from(stat.st_size).map_err(|_| {
+            Error::Configuration(format!("WASIX worker size is invalid: {}", path.display()))
+        })?;
+        let sha256 = sha256_descriptor(&descriptor, bytes, "pinned WASIX worker")
+            .map_err(Error::Configuration)?;
+        Ok(Self {
+            descriptor,
+            path: path.to_owned(),
+            sha256,
+        })
+    }
+
+    fn command(&self, operation: &'static str) -> Result<Command> {
+        use rustix::io::dup;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let descriptor = dup(&self.descriptor).map_err(|error| {
+            Error::Execution(format!("cannot duplicate pinned WASIX worker: {error}"))
+        })?;
+        let argv0 = CString::new(self.path.as_os_str().as_bytes()).map_err(|_| {
+            Error::Configuration("WASIX worker path contains a NUL byte".to_owned())
+        })?;
+        let operation = CString::new(operation).map_err(|_| {
+            Error::Configuration("WASIX worker operation contains a NUL byte".to_owned())
+        })?;
+        let mut command = Command::new("/proc/self/exe");
+        command.arg(std::ffi::OsStr::from_bytes(operation.as_bytes()));
+        install_pinned_exec(&mut command, descriptor, argv0, operation);
+        Ok(command)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_worker_ancestors(path: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let parent = path.parent().ok_or_else(|| {
+        Error::Configuration("WASIX worker path has no parent directory".to_owned())
+    })?;
+    let mut prefix = PathBuf::from("/");
+    validate_worker_ancestor(&prefix)?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(component) => prefix.push(component),
+            _ => {
+                return Err(Error::Configuration(
+                    "WASIX worker path is not canonical".to_owned(),
+                ));
+            }
+        }
+        validate_worker_ancestor(&prefix)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_worker_ancestor(path: &Path) -> Result<()> {
+    use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, fstat, openat2};
+
+    let descriptor = openat2(
+        CWD,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| {
+        Error::Configuration(format!(
+            "cannot pin WASIX worker ancestor {}: {error}",
+            path.display()
+        ))
+    })?;
+    let stat = fstat(&descriptor).map_err(|error| {
+        Error::Configuration(format!(
+            "cannot inspect WASIX worker ancestor {}: {error}",
+            path.display()
+        ))
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || !trusted_worker_owner(stat.st_uid)
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(Error::Configuration(format!(
+            "WASIX worker ancestor is not owner-controlled: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_worker_file_stat(
+    path: &Path,
+    stat: &rustix::fs::Stat,
+    file_type: rustix::fs::FileType,
+) -> Result<()> {
+    if file_type != rustix::fs::FileType::RegularFile
+        || stat.st_size <= 0
+        || !trusted_worker_owner(stat.st_uid)
+        || stat.st_mode & 0o111 == 0
+        || stat.st_mode & 0o6022 != 0
+    {
+        return Err(Error::Configuration(format!(
+            "WASIX worker must be one owner-controlled, non-setid executable: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_worker_file_capabilities(
+    path: &Path,
+    descriptor: &impl std::os::fd::AsFd,
+) -> Result<()> {
+    let mut capabilities = [0_u8; 256];
+    match rustix::fs::fgetxattr(descriptor, "security.capability", &mut capabilities) {
+        Ok(bytes) if bytes != 0 => Err(Error::Configuration(format!(
+            "WASIX worker must not have file capabilities: {}",
+            path.display()
+        ))),
+        Ok(_) | Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => Ok(()),
+        Err(error) => Err(Error::Configuration(format!(
+            "cannot inspect pinned WASIX worker file capabilities for {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_worker_owner(owner: u32) -> bool {
+    owner == 0 || owner == rustix::process::geteuid().as_raw()
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_descriptor(
+    descriptor: &impl std::os::fd::AsFd,
+    bytes: u64,
+    label: &str,
+) -> std::result::Result<String, String> {
+    let mut hash = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    while offset < bytes {
+        let remaining = usize::try_from((bytes - offset).min(buffer.len() as u64))
+            .map_err(|_| format!("{label} read length overflows usize"))?;
+        let read = rustix::io::pread(descriptor, &mut buffer[..remaining], offset)
+            .map_err(|error| format!("cannot read {label}: {error}"))?;
+        if read == 0 {
+            return Err(format!("{label} ended before its pinned length"));
+        }
+        hash.update(&buffer[..read]);
+        offset = offset
+            .checked_add(u64::try_from(read).map_err(|_| format!("{label} read overflow"))?)
+            .ok_or_else(|| format!("{label} offset overflow"))?;
+    }
+    let mut trailing = [0_u8; 1];
+    if rustix::io::pread(descriptor, &mut trailing, bytes)
+        .map_err(|error| format!("cannot finish reading {label}: {error}"))?
+        != 0
+    {
+        return Err(format!("{label} grew while it was pinned"));
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn install_pinned_exec(
+    command: &mut Command,
+    descriptor: std::os::fd::OwnedFd,
+    argv0: CString,
+    operation: CString,
+) {
+    use rustix::fs::AtFlags;
+    let expected_parent = rustix::process::getpid();
+    // SAFETY: the closure runs in the single-threaded post-fork child and uses
+    // only async-signal-safe Linux syscalls. It arms PDEATHSIG and closes the
+    // PPID race before executing the pinned descriptor. All C strings and
+    // pointer arrays remain owned by the closure for the syscall. A successful
+    // execveat never returns; failure is surfaced to Command::spawn and cannot
+    // fall through to the placeholder executable.
+    unsafe {
+        command.pre_exec(move || {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+                .map_err(std::io::Error::from)?;
+            if rustix::process::getppid() != Some(expected_parent) {
+                return Err(std::io::Error::from(rustix::io::Errno::SRCH));
+            }
+            let argv = [
+                argv0.as_ptr().cast(),
+                operation.as_ptr().cast(),
+                std::ptr::null(),
+            ];
+            let envp = [std::ptr::null()];
+            let errno = rustix::runtime::execveat(
+                &descriptor,
+                c"",
+                argv.as_ptr(),
+                envp.as_ptr(),
+                AtFlags::EMPTY_PATH,
+            );
+            Err(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+        });
+    }
 }
 
 /// Compatibility metadata reported by a successfully probed worker process.
@@ -320,6 +525,8 @@ pub struct WasixWorkerMetadata {
     pub runtime_version: String,
     /// Exact Wasmer/WASIX/WebC dependency cohort.
     pub cohort_id: String,
+    /// Lowercase SHA-256 digest of the exact executable image used by this worker.
+    pub worker_build_sha256: String,
     /// Operating-system process identifier of the fresh worker.
     pub process_id: u32,
     /// Verified Linux isolation state established before this frame was written.
@@ -328,17 +535,23 @@ pub struct WasixWorkerMetadata {
 
 impl WasixWorkerMetadata {
     #[cfg(any(feature = "wasix", test))]
-    fn current(isolation: WasixWorkerIsolation) -> Self {
+    fn current(isolation: WasixWorkerIsolation, worker_build_sha256: String) -> Self {
         Self {
             protocol_version: WASIX_WORKER_PROTOCOL_VERSION,
             runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             cohort_id: WASIX_COHORT_ID.to_owned(),
+            worker_build_sha256,
             process_id: std::process::id(),
             isolation,
         }
     }
 
-    fn validate(&self, expected_process_id: u32, allowed_groups: &[u32]) -> Result<()> {
+    fn validate(
+        &self,
+        expected_process_id: u32,
+        expected_worker_build_sha256: &str,
+        allowed_groups: &[u32],
+    ) -> Result<()> {
         if self.protocol_version != WASIX_WORKER_PROTOCOL_VERSION {
             return Err(Error::UnsupportedComponent(format!(
                 "WASIX worker protocol {} is incompatible with required protocol {}",
@@ -356,6 +569,12 @@ impl WasixWorkerMetadata {
             return Err(Error::UnsupportedComponent(format!(
                 "WASIX worker cohort {:?} is incompatible with required cohort {WASIX_COHORT_ID:?}",
                 self.cohort_id
+            )));
+        }
+        if self.worker_build_sha256 != expected_worker_build_sha256 {
+            return Err(Error::UnsupportedComponent(format!(
+                "WASIX worker build {} does not match pinned executable {expected_worker_build_sha256}",
+                self.worker_build_sha256
             )));
         }
         if self.process_id != expected_process_id {
@@ -766,17 +985,38 @@ impl WasixWorkerIsolation {
 /// Returns an error for an invalid deployment path, timeout, malformed frame,
 /// nonzero worker exit, or any identity mismatch.
 pub async fn probe_wasix_worker(config: &WasixWorkerConfig) -> Result<WasixWorkerMetadata> {
-    config.validate()?;
-    let mut command = Command::new(&config.executable);
+    config.validate_common()?;
+    #[cfg(target_os = "linux")]
+    {
+        let executable = config.pin_executable()?;
+        probe_wasix_worker_linux(config, executable).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(Error::Configuration(
+        "the WASIX worker process boundary currently requires Linux".to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_wasix_worker_linux(
+    config: &WasixWorkerConfig,
+    executable: PinnedWorkerExecutable,
+) -> Result<WasixWorkerMetadata> {
+    let mut command = executable.command("--protocol-probe")?;
     command
-        .arg("--protocol-probe")
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut worker = spawn_wasix_worker(config, WasixWorkerOperation::Probe, &mut command).await?;
+    let mut worker = spawn_wasix_worker(
+        config,
+        WasixWorkerOperation::Probe,
+        &mut command,
+        executable.sha256.clone(),
+    )
+    .await?;
     let stdout = worker
         .child
         .stdout
@@ -811,10 +1051,11 @@ pub async fn probe_wasix_checkpoint_transport(
     config: &WasixWorkerConfig,
     checkpoint: VerifiedWasixCheckpoint,
 ) -> Result<WasixCheckpointTransportMetadata> {
-    config.validate()?;
+    config.validate_common()?;
     #[cfg(target_os = "linux")]
     {
-        probe_wasix_checkpoint_transport_linux(config, checkpoint).await
+        let executable = config.pin_executable()?;
+        probe_wasix_checkpoint_transport_linux(config, executable, checkpoint).await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -844,10 +1085,11 @@ pub async fn restore_wasix_checkpoint(
     checkpoint: VerifiedWasixCheckpoint,
     module: Vec<u8>,
 ) -> Result<WasixCheckpointRestoreMetadata> {
-    config.validate()?;
+    config.validate_common()?;
     #[cfg(target_os = "linux")]
     {
-        restore_wasix_checkpoint_linux(config, checkpoint, module).await
+        let executable = config.pin_executable()?;
+        restore_wasix_checkpoint_linux(config, executable, checkpoint, module).await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -876,15 +1118,17 @@ pub async fn capture_wasix_checkpoint(
     module: Vec<u8>,
     input: CommandInput,
 ) -> Result<WasixCheckpointCapture> {
-    config.validate()?;
+    config.validate_common()?;
     let (request, execution_timeout, cancellation) = WasixCheckpointCaptureRequest::new(input)?;
     if cancellation.is_cancelled() {
         return Err(Error::Cancelled);
     }
     #[cfg(target_os = "linux")]
     {
+        let executable = config.pin_executable()?;
         capture_wasix_checkpoint_linux(
             config,
+            executable,
             binding,
             module,
             request,
@@ -905,6 +1149,7 @@ pub async fn capture_wasix_checkpoint(
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
 async fn capture_wasix_checkpoint_linux(
     config: &WasixWorkerConfig,
+    executable: PinnedWorkerExecutable,
     binding: WasixCheckpointBinding,
     module: Vec<u8>,
     request: WasixCheckpointCaptureRequest,
@@ -949,9 +1194,8 @@ async fn capture_wasix_checkpoint_linux(
     }
 
     let (control, child_control) = checkpoint_control_channel()?;
-    let mut command = Command::new(&config.executable);
+    let mut command = executable.command("--checkpoint-capture")?;
     command
-        .arg("--checkpoint-capture")
         .env_clear()
         .current_dir("/")
         .stdin(child_control)
@@ -962,6 +1206,7 @@ async fn capture_wasix_checkpoint_linux(
         config,
         WasixWorkerOperation::CheckpointCapture,
         &mut command,
+        executable.sha256.clone(),
     )
     .await?;
     drop(command);
@@ -1001,6 +1246,7 @@ async fn capture_wasix_checkpoint_linux(
 #[cfg(all(feature = "wasix-checkpoint", target_os = "linux"))]
 async fn restore_wasix_checkpoint_linux(
     config: &WasixWorkerConfig,
+    executable: PinnedWorkerExecutable,
     checkpoint: VerifiedWasixCheckpoint,
     module: Vec<u8>,
 ) -> Result<WasixCheckpointRestoreMetadata> {
@@ -1016,7 +1262,12 @@ async fn restore_wasix_checkpoint_linux(
             "WASIX restore module exceeds the worker input limit".to_owned(),
         ));
     }
-    let journal = checkpoint.into_journal();
+    let (journal, checkpoint_worker_build_sha256) = checkpoint.into_parts();
+    if executable.sha256 != checkpoint_worker_build_sha256 {
+        return Err(Error::Checkpoint(
+            "destination worker build does not match the authenticated source worker".to_owned(),
+        ));
+    }
     if journal.is_empty() || journal.len() > WASIX_WORKER_MAX_CHECKPOINT_BYTES {
         return Err(Error::Checkpoint(
             "verified checkpoint journal exceeds the worker restore limit".to_owned(),
@@ -1043,9 +1294,8 @@ async fn restore_wasix_checkpoint_linux(
     }
 
     let (control, child_control) = checkpoint_control_channel()?;
-    let mut command = Command::new(&config.executable);
+    let mut command = executable.command("--checkpoint-restore")?;
     command
-        .arg("--checkpoint-restore")
         .env_clear()
         .current_dir("/")
         .stdin(child_control)
@@ -1056,6 +1306,7 @@ async fn restore_wasix_checkpoint_linux(
         config,
         WasixWorkerOperation::CheckpointRestore,
         &mut command,
+        executable.sha256.clone(),
     )
     .await?;
     drop(command);
@@ -1093,10 +1344,16 @@ async fn restore_wasix_checkpoint_linux(
 #[cfg(target_os = "linux")]
 async fn probe_wasix_checkpoint_transport_linux(
     config: &WasixWorkerConfig,
+    executable: PinnedWorkerExecutable,
     checkpoint: VerifiedWasixCheckpoint,
 ) -> Result<WasixCheckpointTransportMetadata> {
     let binding = checkpoint.binding().clone();
-    let journal = checkpoint.into_journal();
+    let (journal, checkpoint_worker_build_sha256) = checkpoint.into_parts();
+    if executable.sha256 != checkpoint_worker_build_sha256 {
+        return Err(Error::Checkpoint(
+            "transport worker build does not match the authenticated source worker".to_owned(),
+        ));
+    }
     if journal.is_empty() || journal.len() > WASIX_WORKER_MAX_CHECKPOINT_BYTES {
         return Err(Error::Checkpoint(
             "verified checkpoint journal exceeds the worker transport limit".to_owned(),
@@ -1112,9 +1369,8 @@ async fn probe_wasix_checkpoint_transport_linux(
     }
     let (control, child_control) = checkpoint_control_channel()?;
 
-    let mut command = Command::new(&config.executable);
+    let mut command = executable.command("--checkpoint-transport-probe")?;
     command
-        .arg("--checkpoint-transport-probe")
         .env_clear()
         .current_dir("/")
         .stdin(child_control)
@@ -1125,6 +1381,7 @@ async fn probe_wasix_checkpoint_transport_linux(
         config,
         WasixWorkerOperation::CheckpointTransport,
         &mut command,
+        executable.sha256.clone(),
     )
     .await?;
     drop(command);
@@ -1552,7 +1809,11 @@ async fn perform_checkpoint_transport(
     let ready = read_frame(stdout).await?;
     let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready)
         .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
-    metadata.validate(process_id, allowed_supplementary_groups)?;
+    metadata.validate(
+        process_id,
+        &worker.worker_build_sha256,
+        allowed_supplementary_groups,
+    )?;
 
     let control = input
         .control
@@ -1628,7 +1889,11 @@ async fn perform_checkpoint_restore(
     let ready = read_frame(stdout).await?;
     let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready)
         .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
-    metadata.validate(process_id, allowed_supplementary_groups)?;
+    metadata.validate(
+        process_id,
+        &worker.worker_build_sha256,
+        allowed_supplementary_groups,
+    )?;
 
     let control = input
         .control
@@ -1732,7 +1997,11 @@ async fn perform_checkpoint_capture(
         let metadata: WasixWorkerMetadata = serde_json::from_slice(&ready).map_err(|error| {
             Error::Execution(format!("invalid WASIX capture Ready frame: {error}"))
         })?;
-        metadata.validate(process_id, allowed_supplementary_groups)?;
+        metadata.validate(
+            process_id,
+            &worker.worker_build_sha256,
+            allowed_supplementary_groups,
+        )?;
         let control = input
             .control
             .as_mut()
@@ -1809,6 +2078,7 @@ async fn perform_checkpoint_capture(
     let journal = CapturedWasixJournal::from_attested_worker_capture(
         journal,
         input.expected.binding.clone(),
+        metadata.worker_build_sha256.clone(),
     )?;
     Ok(WasixCheckpointCapture {
         worker: metadata,
@@ -1878,7 +2148,11 @@ async fn perform_handshake(
     let frame = read_frame(stdout).await?;
     let metadata: WasixWorkerMetadata = serde_json::from_slice(&frame)
         .map_err(|error| Error::Execution(format!("invalid WASIX worker ready frame: {error}")))?;
-    metadata.validate(process_id, allowed_supplementary_groups)?;
+    metadata.validate(
+        process_id,
+        &worker.worker_build_sha256,
+        allowed_supplementary_groups,
+    )?;
 
     finish_worker_output(worker, stdout, "probe").await?;
     Ok(metadata)
@@ -2063,8 +2337,8 @@ async fn spawn_wasix_worker(
     config: &WasixWorkerConfig,
     operation: WasixWorkerOperation,
     command: &mut Command,
+    worker_build_sha256: String,
 ) -> Result<WorkerProcess> {
-    configure_worker_parent_death(command);
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
@@ -2073,7 +2347,7 @@ async fn spawn_wasix_worker(
             config.executable.display()
         ))
     })?;
-    let mut worker = WorkerProcess::new(child)?;
+    let mut worker = WorkerProcess::new(child, worker_build_sha256)?;
 
     if let Some(placement) = &config.placement {
         let request = WasixWorkerPlacementRequest {
@@ -2101,46 +2375,22 @@ async fn spawn_wasix_worker(
     Ok(worker)
 }
 
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn configure_worker_parent_death(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    let expected_parent = rustix::process::getpid();
-    // SAFETY: this closure runs in the single-threaded post-fork child and uses
-    // only async-signal-safe Linux syscalls before exec. Setting PDEATHSIG first
-    // and then checking PPID closes the race where the parent dies between fork
-    // and prctl: either PPID has changed and exec is rejected, or SIGKILL is
-    // already armed for a later parent death.
-    unsafe {
-        command.as_std_mut().pre_exec(move || {
-            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
-                .map_err(std::io::Error::from)?;
-            if rustix::process::getppid() != Some(expected_parent) {
-                return Err(std::io::Error::from(rustix::io::Errno::SRCH));
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn configure_worker_parent_death(_command: &mut Command) {}
-
 struct WorkerProcess {
     child: tokio::process::Child,
     process_id: u32,
+    worker_build_sha256: String,
     active: bool,
 }
 
 impl WorkerProcess {
-    fn new(child: tokio::process::Child) -> Result<Self> {
+    fn new(child: tokio::process::Child, worker_build_sha256: String) -> Result<Self> {
         let process_id = child.id().ok_or_else(|| {
             Error::Execution("WASIX worker did not expose a process identifier".to_owned())
         })?;
         Ok(Self {
             child,
             process_id,
+            worker_build_sha256,
             active: true,
         })
     }
@@ -2506,16 +2756,45 @@ fn lower_worker_limit(
     Ok([current, hard])
 }
 
-/// Enter the worker isolation profile and write one version 4 ready frame.
+#[cfg(all(feature = "wasix", target_os = "linux"))]
+fn current_worker_build_sha256() -> std::result::Result<String, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open};
+
+    let executable = open(
+        "/proc/self/exe",
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("cannot open running WASIX worker image: {error}"))?;
+    let stat = fstat(&executable)
+        .map_err(|error| format!("cannot inspect running WASIX worker image: {error}"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_size <= 0 {
+        return Err("running WASIX worker image is not a regular executable".to_owned());
+    }
+    let bytes = u64::try_from(stat.st_size)
+        .map_err(|_| "running WASIX worker image size is invalid".to_owned())?;
+    sha256_descriptor(&executable, bytes, "running WASIX worker image")
+}
+
+#[cfg(all(feature = "wasix", not(target_os = "linux")))]
+fn current_worker_build_sha256() -> std::result::Result<String, String> {
+    Err("WASIX worker build identity requires Linux".to_owned())
+}
+
+/// Enter the worker isolation profile and write one version 7 ready frame.
 ///
 /// This function must be called from the worker's initial thread before a
 /// Tokio runtime is created and before any guest-controlled bytes are read.
 #[doc(hidden)]
 #[cfg(feature = "wasix")]
 pub fn write_wasix_worker_probe(mut writer: impl Write) -> std::result::Result<(), String> {
+    let worker_build_sha256 = current_worker_build_sha256()?;
     let isolation = enter_wasix_worker_isolation()?;
-    let frame = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
-        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    let frame = serde_json::to_vec(&WasixWorkerMetadata::current(
+        isolation,
+        worker_build_sha256,
+    ))
+    .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
     write_worker_frame(&mut writer, &frame)
 }
 
@@ -2531,9 +2810,13 @@ pub fn write_wasix_checkpoint_transport_probe(
 ) -> std::result::Result<(), String> {
     use rustix::fs::{Mode, OFlags, open};
 
+    let worker_build_sha256 = current_worker_build_sha256()?;
     let isolation = enter_wasix_worker_isolation()?;
-    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
-        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(
+        isolation,
+        worker_build_sha256,
+    ))
+    .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
     write_worker_frame(&mut writer, &ready)?;
 
     let checkpoint = receive_checkpoint_descriptor(&reader, b'C', "checkpoint")?;
@@ -2630,9 +2913,13 @@ pub fn write_wasix_checkpoint_restore(
 ) -> std::result::Result<(), String> {
     use rustix::fs::{Mode, OFlags, open};
 
+    let worker_build_sha256 = current_worker_build_sha256()?;
     let isolation = enter_wasix_worker_isolation()?;
-    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
-        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(
+        isolation,
+        worker_build_sha256,
+    ))
+    .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
     write_worker_frame(&mut writer, &ready)?;
 
     let module = receive_checkpoint_descriptor(&reader, b'M', "module")?;
@@ -2696,9 +2983,13 @@ pub fn write_wasix_checkpoint_capture(
 ) -> std::result::Result<(), String> {
     use rustix::fs::{Mode, OFlags, open};
 
+    let worker_build_sha256 = current_worker_build_sha256()?;
     let isolation = enter_wasix_worker_isolation()?;
-    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(isolation))
-        .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
+    let ready = serde_json::to_vec(&WasixWorkerMetadata::current(
+        isolation,
+        worker_build_sha256,
+    ))
+    .map_err(|error| format!("cannot encode worker metadata: {error}"))?;
     write_worker_frame(&mut writer, &ready)?;
 
     let module = receive_checkpoint_descriptor(&reader, b'M', "module")?;
@@ -3268,6 +3559,42 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_worker_survives_path_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let current = std::env::current_exe().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("runtrue-pinned-worker-")
+            .tempdir_in(current.parent().unwrap())
+            .unwrap();
+        let worker = directory.path().join("worker");
+        std::fs::copy(&current, &worker).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = PinnedWorkerExecutable::open(&worker).unwrap();
+
+        std::fs::rename(&worker, directory.path().join("replaced-worker")).unwrap();
+        std::fs::write(&worker, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut command = pinned.command("--list").unwrap();
+        command
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("pinned_worker_survives_path_replacement")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn cancelled_checkpoint_preparation_stops_before_transport() {
         let cancelled = AtomicBool::new(true);
@@ -3280,33 +3607,45 @@ mod tests {
     #[test]
     fn rejects_each_worker_compatibility_mismatch() {
         let process_id = std::process::id();
+        let worker_build_sha256 = "4".repeat(64);
 
         let isolation = WasixWorkerIsolation::compatible_for_test();
-        let mut metadata = WasixWorkerMetadata::current(isolation.clone());
+        let mut metadata =
+            WasixWorkerMetadata::current(isolation.clone(), worker_build_sha256.clone());
         metadata.protocol_version += 1;
         assert!(matches!(
-            metadata.validate(process_id, &[]),
+            metadata.validate(process_id, &worker_build_sha256, &[]),
             Err(Error::UnsupportedComponent(_))
         ));
 
-        let mut metadata = WasixWorkerMetadata::current(isolation.clone());
+        let mut metadata =
+            WasixWorkerMetadata::current(isolation.clone(), worker_build_sha256.clone());
         metadata.runtime_version.push_str("-other");
         assert!(matches!(
-            metadata.validate(process_id, &[]),
+            metadata.validate(process_id, &worker_build_sha256, &[]),
             Err(Error::UnsupportedComponent(_))
         ));
 
-        let mut metadata = WasixWorkerMetadata::current(isolation.clone());
+        let mut metadata =
+            WasixWorkerMetadata::current(isolation.clone(), worker_build_sha256.clone());
         metadata.cohort_id.push_str("-other");
         assert!(matches!(
-            metadata.validate(process_id, &[]),
+            metadata.validate(process_id, &worker_build_sha256, &[]),
             Err(Error::UnsupportedComponent(_))
         ));
 
-        let mut metadata = WasixWorkerMetadata::current(isolation);
+        let mut metadata =
+            WasixWorkerMetadata::current(isolation.clone(), worker_build_sha256.clone());
+        metadata.worker_build_sha256 = "5".repeat(64);
+        assert!(matches!(
+            metadata.validate(process_id, &worker_build_sha256, &[]),
+            Err(Error::UnsupportedComponent(_))
+        ));
+
+        let mut metadata = WasixWorkerMetadata::current(isolation, worker_build_sha256.clone());
         metadata.process_id = process_id.saturating_add(1);
         assert!(matches!(
-            metadata.validate(process_id, &[]),
+            metadata.validate(process_id, &worker_build_sha256, &[]),
             Err(Error::Execution(_))
         ));
     }
