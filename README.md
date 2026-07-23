@@ -67,7 +67,10 @@ its portable exit code or Unix termination signal.
 `capture_wasix_checkpoint` starts a fresh isolated source worker with bounded
 arguments and environment, stops at an explicit WASIX snapshot, and returns a
 trusted journal for `WasixCheckpointCodec::seal`. Standard input is not yet
-supported by the capture path.
+supported by the capture path. Worker-process diagnostics are concurrently
+drained into a separate bounded buffer and redacted from ordinary `Display` and
+`Debug` error formatting. Structured capture failures report their protocol
+phase and, when observable, the worker exit code or Unix termination signal.
 
 To move the checkpoint, authenticate the captured journal with
 `WasixCheckpointCodec`, transfer the sealed artifact and exact module to the

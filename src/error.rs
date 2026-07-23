@@ -24,6 +24,30 @@ pub enum WasixCheckpointRestorePhase {
     Shutdown,
 }
 
+/// Capture protocol phase in which a checkpoint operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WasixCheckpointCapturePhase {
+    /// The source worker did not complete its compatibility handshake.
+    #[error("worker readiness")]
+    Ready,
+    /// Sealed module or capture request inputs were not accepted.
+    #[error("sealed input transfer")]
+    Input,
+    /// The worker could not be authorized to execute the capture.
+    #[error("execution authorization")]
+    Authorization,
+    /// The source workload did not reach a valid explicit checkpoint.
+    #[error("checkpoint execution")]
+    Execution,
+    /// Bounded checkpoint or guest output was malformed or incomplete.
+    #[error("output collection")]
+    Output,
+    /// The worker did not shut down cleanly after capture.
+    #[error("worker shutdown")]
+    Shutdown,
+}
+
 /// Stable, non-secret classification of a checkpoint restore failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -42,11 +66,29 @@ pub enum WasixCheckpointRestoreFailureReason {
     WorkerProcess,
 }
 
-/// Bounded diagnostics emitted by the isolated worker process itself.
+/// Stable, non-secret classification of a checkpoint capture failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WasixCheckpointCaptureFailureReason {
+    /// The worker violated or could not complete the authenticated protocol.
+    #[error("worker protocol failure")]
+    Protocol,
+    /// The source workload or WASIX runtime failed during capture.
+    #[error("checkpoint runtime failure")]
+    Runtime,
+    /// A bounded resource, checkpoint, or output limit was exceeded.
+    #[error("checkpoint resource limit")]
+    ResourceLimit,
+    /// The worker process failed to exit successfully.
+    #[error("worker process failure")]
+    WorkerProcess,
+}
+
+/// Bounded diagnostics emitted by an isolated worker process.
 ///
 /// These bytes are separate from guest standard error. Debug formatting is
-/// deliberately redacted so error logs do not disclose module or checkpoint
-/// details unless a caller explicitly retrieves the bytes.
+/// deliberately redacted so error logs do not disclose module, argument, or
+/// environment details unless a caller explicitly retrieves the bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WasixWorkerDiagnostics {
     bytes: Vec<u8>,
@@ -105,10 +147,34 @@ pub struct WasixCheckpointRestoreFailure {
     exit_signal: Option<i32>,
 }
 
+/// Structured checkpoint capture failure with explicitly accessed diagnostics.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[error("WASIX checkpoint capture failed during {phase}: {reason}")]
+pub struct WasixCheckpointCaptureFailure {
+    phase: WasixCheckpointCapturePhase,
+    reason: WasixCheckpointCaptureFailureReason,
+    diagnostics: WasixWorkerDiagnostics,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+}
+
 impl std::fmt::Debug for WasixCheckpointRestoreFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("WasixCheckpointRestoreFailure")
+            .field("phase", &self.phase)
+            .field("reason", &self.reason)
+            .field("diagnostics", &self.diagnostics)
+            .field("exit_code", &self.exit_code)
+            .field("exit_signal", &self.exit_signal)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for WasixCheckpointCaptureFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasixCheckpointCaptureFailure")
             .field("phase", &self.phase)
             .field("reason", &self.reason)
             .field("diagnostics", &self.diagnostics)
@@ -154,6 +220,64 @@ impl WasixCheckpointRestoreFailure {
     /// Stable failure category suitable for metrics and retry policy.
     #[must_use]
     pub const fn reason(&self) -> WasixCheckpointRestoreFailureReason {
+        self.reason
+    }
+
+    /// Bounded, explicitly accessed worker-process diagnostics.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &WasixWorkerDiagnostics {
+        &self.diagnostics
+    }
+
+    /// Portable worker exit code, when the failed worker exited normally.
+    #[must_use]
+    pub const fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Unix signal that terminated the failed worker, when observable.
+    #[must_use]
+    pub const fn exit_signal(&self) -> Option<i32> {
+        self.exit_signal
+    }
+}
+
+impl WasixCheckpointCaptureFailure {
+    #[cfg(feature = "wasix-checkpoint")]
+    pub(crate) const fn new(
+        phase: WasixCheckpointCapturePhase,
+        reason: WasixCheckpointCaptureFailureReason,
+        diagnostics: WasixWorkerDiagnostics,
+    ) -> Self {
+        Self {
+            phase,
+            reason,
+            diagnostics,
+            exit_code: None,
+            exit_signal: None,
+        }
+    }
+
+    #[cfg(feature = "wasix-checkpoint")]
+    pub(crate) const fn with_exit_status(
+        mut self,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+    ) -> Self {
+        self.exit_code = exit_code;
+        self.exit_signal = exit_signal;
+        self
+    }
+
+    /// Capture protocol phase that failed.
+    #[must_use]
+    pub const fn phase(&self) -> WasixCheckpointCapturePhase {
+        self.phase
+    }
+
+    /// Stable failure category suitable for metrics and retry policy.
+    #[must_use]
+    pub const fn reason(&self) -> WasixCheckpointCaptureFailureReason {
         self.reason
     }
 
@@ -222,6 +346,9 @@ pub enum Error {
     /// An isolated WASIX destination failed during a specific restore phase.
     #[error(transparent)]
     CheckpointRestore(WasixCheckpointRestoreFailure),
+    /// An isolated WASIX source failed during a specific capture phase.
+    #[error(transparent)]
+    CheckpointCapture(WasixCheckpointCaptureFailure),
 }
 
 impl From<io::Error> for Error {

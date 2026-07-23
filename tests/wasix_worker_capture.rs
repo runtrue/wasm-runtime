@@ -26,7 +26,15 @@ async fn captures_a_real_checkpoint_in_a_fresh_worker() {
         CommandInput::default().with_args([VALUE]),
     )
     .await
-    .expect("source worker must capture the explicit checkpoint");
+    .unwrap_or_else(|error| {
+        if let Error::CheckpointCapture(failure) = &error {
+            panic!(
+                "source worker must capture the explicit checkpoint: {error}; worker diagnostics: {}",
+                String::from_utf8_lossy(failure.diagnostics().as_bytes())
+            );
+        }
+        panic!("source worker must capture the explicit checkpoint: {error}");
+    });
 
     assert_eq!(capture.binding, binding);
     assert!(capture.stdout.is_empty(), "source must stop before stdout");
@@ -97,6 +105,53 @@ async fn captures_a_real_checkpoint_in_a_fresh_worker() {
         hex::encode(Sha256::digest(verified.journal())),
         capture.journal_sha256
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_captures_complete_without_protocol_eof() {
+    const CAPTURES: usize = 4;
+
+    let module_sha256 = hex::encode(Sha256::digest(FIXTURE));
+    let mut captures = tokio::task::JoinSet::new();
+    for capture_id in 0..CAPTURES {
+        let binding = WasixCheckpointBinding::new(
+            format!("sha256:{}", "1".repeat(64)),
+            module_sha256.clone(),
+            "_start",
+            format!("concurrent-source-{capture_id}"),
+            1,
+        )
+        .expect("concurrent fixture binding must be valid");
+        captures.spawn(async move {
+            capture_wasix_checkpoint(
+                &worker_config(),
+                binding,
+                FIXTURE.to_vec(),
+                CommandInput::default().with_args([VALUE]),
+            )
+            .await
+        });
+    }
+
+    let mut completed = 0;
+    while let Some(result) = captures.join_next().await {
+        let capture = result
+            .expect("concurrent capture task must be joinable")
+            .unwrap_or_else(|error| {
+                if let Error::CheckpointCapture(failure) = &error {
+                    panic!(
+                        "concurrent source worker must capture without retry: {error}; worker diagnostics: {}",
+                        String::from_utf8_lossy(failure.diagnostics().as_bytes())
+                    );
+                }
+                panic!("concurrent source worker must capture without retry: {error}");
+            });
+        assert!(!capture.journal().is_empty());
+        assert!(capture.stdout.is_empty());
+        assert!(capture.stderr.is_empty());
+        completed += 1;
+    }
+    assert_eq!(completed, CAPTURES);
 }
 
 #[tokio::test]
