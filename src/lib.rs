@@ -47,7 +47,8 @@ pub use wasix_worker::write_wasix_checkpoint_capture;
 pub use wasix_worker::write_wasix_checkpoint_restore;
 pub use wasix_worker::{
     WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION, WasixCheckpointTransportMetadata,
-    WasixWorkerConfig, WasixWorkerIsolation, WasixWorkerMetadata, probe_wasix_checkpoint_transport,
+    WasixWorkerConfig, WasixWorkerIsolation, WasixWorkerMetadata, WasixWorkerOperation,
+    WasixWorkerPlacement, WasixWorkerPlacementRequest, probe_wasix_checkpoint_transport,
     probe_wasix_worker,
 };
 #[cfg(feature = "wasix-checkpoint")]

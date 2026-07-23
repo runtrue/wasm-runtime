@@ -4,8 +4,8 @@
 
 use runtrue_wasm_runtime::{
     CheckpointAuthenticationKey, Error, WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION,
-    WasixCheckpointBinding, WasixCheckpointCodec, WasixWorkerConfig,
-    probe_wasix_checkpoint_transport, probe_wasix_worker,
+    WasixCheckpointBinding, WasixCheckpointCodec, WasixWorkerConfig, WasixWorkerOperation,
+    WasixWorkerPlacementRequest, probe_wasix_checkpoint_transport, probe_wasix_worker,
 };
 use sha2::{Digest as _, Sha256};
 use std::{io::Seek as _, process::Stdio, time::Duration};
@@ -238,6 +238,133 @@ async fn timeout_and_cancellation_kill_the_complete_probe_process_group() {
     assert!(task.await.unwrap_err().is_cancelled());
     wait_for_process_exit(worker_pid).await;
     wait_for_process_exit(descendant).await;
+}
+
+#[tokio::test]
+async fn placement_runs_for_the_spawned_worker_before_success() {
+    use std::sync::{Arc, Mutex};
+
+    let observed = Arc::new(Mutex::new(None));
+    let placement_observed = Arc::clone(&observed);
+    let config = WasixWorkerConfig::new(WORKER)
+        .with_allowed_supplementary_groups(expected_worker_groups())
+        .with_worker_placement(move |request: WasixWorkerPlacementRequest| {
+            assert_eq!(request.operation(), WasixWorkerOperation::Probe);
+            assert!(
+                std::path::Path::new(&format!("/proc/{}/status", request.process_id())).exists()
+            );
+            *placement_observed.lock().unwrap() = Some(request.process_id());
+            Ok(())
+        });
+    assert!(config.has_worker_placement());
+
+    let metadata = probe_wasix_worker(&config).await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), Some(metadata.process_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_rejection_precedes_checkpoint_input() {
+    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let worker = directory.path().join("input-observer");
+    let temporary_input = directory.path().join("input.pending");
+    let received_input = directory.path().join("input.received");
+    let mut executable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&worker)
+        .unwrap();
+    writeln!(
+        executable,
+        "#!/bin/sh\ndd bs=1 count=1 of='{}' 2>/dev/null && mv '{}' '{}'\n",
+        temporary_input.display(),
+        temporary_input.display(),
+        received_input.display()
+    )
+    .unwrap();
+    executable.sync_all().unwrap();
+    drop(executable);
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let marker = received_input.clone();
+    let config = WasixWorkerConfig::new(worker)
+        .with_handshake_timeout(Duration::from_secs(5))
+        .with_worker_placement(move |request: WasixWorkerPlacementRequest| {
+            assert_eq!(
+                request.operation(),
+                WasixWorkerOperation::CheckpointTransport
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !marker.exists(),
+                "worker received checkpoint bytes before placement completed"
+            );
+            Err(Error::Configuration("test placement rejection".to_owned()))
+        });
+
+    let error = probe_wasix_checkpoint_transport(&config, verified_transport_checkpoint())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Execution(ref message) if message.contains("placement rejected")),
+        "{error:?}"
+    );
+    assert!(!received_input.exists());
+}
+
+#[test]
+fn parent_death_helper_process() {
+    let Some(worker) = std::env::var_os("RUNTRUE_PARENT_DEATH_WORKER") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = WasixWorkerConfig::new(worker).with_handshake_timeout(Duration::from_secs(30));
+    let _ = runtime.block_on(probe_wasix_worker(&config));
+}
+
+#[tokio::test]
+async fn worker_dies_when_its_parent_process_is_lost() {
+    use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let worker = directory.path().join("parent-death-worker");
+    let worker_pid_file = directory.path().join("worker.pid");
+    let mut executable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&worker)
+        .unwrap();
+    writeln!(
+        executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec /bin/sleep 30\n",
+        worker_pid_file.display()
+    )
+    .unwrap();
+    executable.sync_all().unwrap();
+    drop(executable);
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut parent = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("parent_death_helper_process")
+        .arg("--nocapture")
+        .env("RUNTRUE_PARENT_DEATH_WORKER", &worker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let worker_pid = wait_for_pid(&worker_pid_file).await;
+    assert!(rustix::process::test_kill_process(worker_pid).is_ok());
+
+    parent.start_kill().unwrap();
+    let _ = parent.wait().await.unwrap();
+    wait_for_process_exit(worker_pid).await;
 }
 
 #[cfg(unix)]

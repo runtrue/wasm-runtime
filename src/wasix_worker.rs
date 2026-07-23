@@ -11,14 +11,12 @@ use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
 #[cfg(target_os = "linux")]
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -65,11 +63,106 @@ const REQUIRED_CHECKPOINT_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::
 /// trusted, administrator-controlled path. The protocol probe checks reported
 /// compatibility; it is not a signature over the executable. Version 6 of the
 /// worker process boundary is supported on Linux only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct WasixWorkerConfig {
     executable: PathBuf,
     handshake_timeout: Duration,
     allowed_supplementary_groups: Vec<u32>,
+    placement: Option<Arc<dyn WasixWorkerPlacement>>,
+}
+
+impl std::fmt::Debug for WasixWorkerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WasixWorkerConfig")
+            .field("executable", &self.executable)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field(
+                "allowed_supplementary_groups",
+                &self.allowed_supplementary_groups,
+            )
+            .field("placement_configured", &self.placement.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for WasixWorkerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.executable == other.executable
+            && self.handshake_timeout == other.handshake_timeout
+            && self.allowed_supplementary_groups == other.allowed_supplementary_groups
+            && match (&self.placement, &other.placement) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for WasixWorkerConfig {}
+
+/// Operation for which a fresh isolated WASIX worker was spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WasixWorkerOperation {
+    /// Compatibility and isolation probe without guest input.
+    Probe,
+    /// Sealed checkpoint transport qualification.
+    CheckpointTransport,
+    /// Restore and resume an authenticated checkpoint.
+    CheckpointRestore,
+    /// Execute a source workload until its explicit checkpoint.
+    CheckpointCapture,
+}
+
+/// Identity passed to a configured pre-input worker placement policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasixWorkerPlacementRequest {
+    process_id: u32,
+    operation: WasixWorkerOperation,
+}
+
+impl WasixWorkerPlacementRequest {
+    /// Operating-system process identifier of the newly spawned worker.
+    #[must_use]
+    pub const fn process_id(self) -> u32 {
+        self.process_id
+    }
+
+    /// Worker operation that will run after placement succeeds.
+    #[must_use]
+    pub const fn operation(self) -> WasixWorkerOperation {
+        self.operation
+    }
+}
+
+/// Synchronous, fail-closed placement policy for newly spawned WASIX workers.
+///
+/// The callback runs immediately after spawn and before the parent sends module,
+/// checkpoint, request, or Execute bytes. A deployment can use the PID to write
+/// the worker into a pre-created cgroup v2 `cgroup.procs` file, then verify the
+/// resulting membership before returning. Returning an error kills and reaps
+/// the worker without authorizing guest execution.
+///
+/// Implementations must complete promptly and must not retain the PID for a
+/// later asynchronous action. The child remains an unreaped child throughout
+/// this callback, preventing its PID from being recycled during placement.
+pub trait WasixWorkerPlacement: Send + Sync + 'static {
+    /// Place and authorize one fresh worker before any workload input is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error rejects the worker and aborts the operation.
+    fn place(&self, request: WasixWorkerPlacementRequest) -> Result<()>;
+}
+
+impl<F> WasixWorkerPlacement for F
+where
+    F: Fn(WasixWorkerPlacementRequest) -> Result<()> + Send + Sync + 'static,
+{
+    fn place(&self, request: WasixWorkerPlacementRequest) -> Result<()> {
+        self(request)
+    }
 }
 
 impl WasixWorkerConfig {
@@ -80,6 +173,7 @@ impl WasixWorkerConfig {
             executable: executable.into(),
             handshake_timeout: Duration::from_secs(5),
             allowed_supplementary_groups: Vec::new(),
+            placement: None,
         }
     }
 
@@ -120,6 +214,26 @@ impl WasixWorkerConfig {
         self
     }
 
+    /// Require a deployment placement policy before accepting worker input.
+    ///
+    /// The policy is invoked for every worker spawned by this configuration.
+    /// Failure is fail-closed: the worker is killed and reaped, and no guest,
+    /// module, checkpoint, request, or Execute bytes are sent. The default
+    /// configuration has no policy and therefore makes no cgroup-placement
+    /// claim; production deployments that require per-invocation cgroups must
+    /// configure and verify them here.
+    #[must_use]
+    pub fn with_worker_placement(mut self, placement: impl WasixWorkerPlacement) -> Self {
+        self.placement = Some(Arc::new(placement));
+        self
+    }
+
+    /// Whether a fail-closed external placement policy is configured.
+    #[must_use]
+    pub fn has_worker_placement(&self) -> bool {
+        self.placement.is_some()
+    }
+
     fn validate(&self) -> Result<()> {
         if !cfg!(target_os = "linux") {
             return Err(Error::Configuration(
@@ -147,11 +261,37 @@ impl WasixWorkerConfig {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
+            let mode = metadata.permissions().mode();
+            if mode & 0o111 == 0 {
                 return Err(Error::Configuration(format!(
                     "WASIX worker is not executable: {}",
                     self.executable.display()
                 )));
+            }
+            if mode & 0o6000 != 0 {
+                return Err(Error::Configuration(format!(
+                    "WASIX worker must not be set-user-ID or set-group-ID: {}",
+                    self.executable.display()
+                )));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut capabilities = [0_u8; 256];
+            match rustix::fs::getxattr(&self.executable, "security.capability", &mut capabilities) {
+                Ok(bytes) if bytes != 0 => {
+                    return Err(Error::Configuration(format!(
+                        "WASIX worker must not have file capabilities: {}",
+                        self.executable.display()
+                    )));
+                }
+                Ok(_) | Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => {}
+                Err(error) => {
+                    return Err(Error::Configuration(format!(
+                        "cannot inspect WASIX worker file capabilities for {}: {error}",
+                        self.executable.display()
+                    )));
+                }
             }
         }
         if self.handshake_timeout.is_zero() || self.handshake_timeout > MAX_HANDSHAKE_TIMEOUT {
@@ -636,15 +776,7 @@ pub async fn probe_wasix_worker(config: &WasixWorkerConfig) -> Result<WasixWorke
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        Error::Execution(format!(
-            "failed to spawn WASIX worker {}: {error}",
-            config.executable.display()
-        ))
-    })?;
-    let mut worker = WorkerProcess::new(child)?;
+    let mut worker = spawn_wasix_worker(config, WasixWorkerOperation::Probe, &mut command).await?;
     let stdout = worker
         .child
         .stdout
@@ -826,16 +958,13 @@ async fn capture_wasix_checkpoint_linux(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        Error::Execution(format!(
-            "failed to spawn WASIX capture worker {}: {error}",
-            config.executable.display()
-        ))
-    })?;
+    let mut worker = spawn_wasix_worker(
+        config,
+        WasixWorkerOperation::CheckpointCapture,
+        &mut command,
+    )
+    .await?;
     drop(command);
-    let mut worker = WorkerProcess::new(child)?;
     let stdout =
         worker.child.stdout.take().ok_or_else(|| {
             Error::Execution("WASIX capture worker stdout was not piped".to_owned())
@@ -923,16 +1052,13 @@ async fn restore_wasix_checkpoint_linux(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        Error::Execution(format!(
-            "failed to spawn WASIX restore worker {}: {error}",
-            config.executable.display()
-        ))
-    })?;
+    let mut worker = spawn_wasix_worker(
+        config,
+        WasixWorkerOperation::CheckpointRestore,
+        &mut command,
+    )
+    .await?;
     drop(command);
-    let mut worker = WorkerProcess::new(child)?;
     let stdout =
         worker.child.stdout.take().ok_or_else(|| {
             Error::Execution("WASIX restore worker stdout was not piped".to_owned())
@@ -995,16 +1121,13 @@ async fn probe_wasix_checkpoint_transport_linux(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().map_err(|error| {
-        Error::Execution(format!(
-            "failed to spawn WASIX worker {}: {error}",
-            config.executable.display()
-        ))
-    })?;
+    let mut worker = spawn_wasix_worker(
+        config,
+        WasixWorkerOperation::CheckpointTransport,
+        &mut command,
+    )
+    .await?;
     drop(command);
-    let mut worker = WorkerProcess::new(child)?;
     let stdout = worker
         .child
         .stdout
@@ -1936,6 +2059,74 @@ impl Drop for CheckpointTransportSupervisor {
     }
 }
 
+async fn spawn_wasix_worker(
+    config: &WasixWorkerConfig,
+    operation: WasixWorkerOperation,
+    command: &mut Command,
+) -> Result<WorkerProcess> {
+    configure_worker_parent_death(command);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command.spawn().map_err(|error| {
+        Error::Execution(format!(
+            "failed to spawn WASIX worker {}: {error}",
+            config.executable.display()
+        ))
+    })?;
+    let mut worker = WorkerProcess::new(child)?;
+
+    if let Some(placement) = &config.placement {
+        let request = WasixWorkerPlacementRequest {
+            process_id: worker.process_id,
+            operation,
+        };
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| placement.place(request)));
+        let rejection = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!(
+                "WASIX worker placement rejected the process: {error}"
+            )),
+            Err(_) => Some("WASIX worker placement policy panicked".to_owned()),
+        };
+        if let Some(rejection) = rejection {
+            worker.kill_tree();
+            let _ = worker.child.start_kill();
+            let _ = worker.child.wait().await;
+            worker.disarm();
+            return Err(Error::Execution(rejection));
+        }
+    }
+
+    Ok(worker)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_worker_parent_death(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    let expected_parent = rustix::process::getpid();
+    // SAFETY: this closure runs in the single-threaded post-fork child and uses
+    // only async-signal-safe Linux syscalls before exec. Setting PDEATHSIG first
+    // and then checking PPID closes the race where the parent dies between fork
+    // and prctl: either PPID has changed and exec is rejected, or SIGKILL is
+    // already armed for a later parent death.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+                .map_err(std::io::Error::from)?;
+            if rustix::process::getppid() != Some(expected_parent) {
+                return Err(std::io::Error::from(rustix::io::Errno::SRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_worker_parent_death(_command: &mut Command) {}
+
 struct WorkerProcess {
     child: tokio::process::Child,
     process_id: u32,
@@ -2063,6 +2254,18 @@ fn enter_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolation, S
 }
 
 #[cfg(all(feature = "wasix", target_os = "linux"))]
+fn rearm_worker_parent_death(
+    expected_parent: rustix::process::Pid,
+) -> std::result::Result<(), String> {
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(|error| format!("failed to re-arm worker parent-death protection: {error}"))?;
+    if rustix::process::getppid() != Some(expected_parent) {
+        return Err("WASIX worker parent exited during isolation setup".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "wasix", target_os = "linux"))]
 fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolation, String> {
     use nix::unistd::{
         Gid, Uid, getgroups, getresgid, getresuid, setfsgid, setfsuid, setgroups, setresgid,
@@ -2073,6 +2276,8 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
         thread::{CapabilitySet, CapabilitySets},
     };
 
+    let expected_parent = rustix::process::getppid()
+        .ok_or_else(|| "WASIX worker has no live parent process".to_owned())?;
     let closed_inherited_descriptor_count = close_inherited_worker_descriptors()?;
     let core_file_limits = lower_worker_limit(Resource::Core, 0)?;
     let file_size_limits = lower_worker_limit(Resource::Fsize, WASIX_WORKER_MAX_FILE_BYTES)?;
@@ -2116,6 +2321,11 @@ fn enter_linux_wasix_worker_isolation() -> std::result::Result<WasixWorkerIsolat
         .map_err(|error| format!("failed to inspect final worker group IDs: {error}"))?;
     let _previous_filesystem_group = setfsgid(final_groups.effective);
     let _previous_filesystem_user = setfsuid(final_users.effective);
+
+    // Linux clears PDEATHSIG when effective or filesystem credentials change.
+    // Re-arm it after every credential transition, then close the corresponding
+    // parent-loss race before the worker can report Ready or accept input.
+    rearm_worker_parent_death(expected_parent)?;
 
     let empty_capabilities = CapabilitySets {
         effective: CapabilitySet::empty(),

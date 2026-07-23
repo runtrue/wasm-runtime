@@ -37,6 +37,20 @@ The checkpoint feature does not relax the worker trust boundary: guest input
 is still withheld until the fresh worker reports the required compatibility
 and Linux isolation state.
 
+Every Linux worker arms `SIGKILL` as its parent-death signal before `exec` and
+checks for a parent-loss race, so a worker cannot continue when its immediate
+runtime parent disappears. This protects the worker process itself; deployments
+that permit native descendants must additionally use a cgroup whose lifecycle
+is owned by the supervisor.
+
+`WasixWorkerConfig::with_worker_placement` installs a synchronous, fail-closed
+placement policy that runs with the fresh PID before the parent sends module,
+checkpoint, request, or Execute bytes. A production scheduler can use it to
+attach each invocation to a pre-created cgroup v2 and verify membership before
+returning. A placement error kills and reaps the worker. The default config has
+no placement policy and does **not** claim cgroup CPU, memory, PID, or descendant
+containment; deployments requiring those controls must configure the policy.
+
 `restore_wasix_checkpoint` accepts an authenticated checkpoint and its exact
 module, starts a fresh isolated destination worker, and resumes without any
 destination arguments. Restored arguments and process state come only from the
