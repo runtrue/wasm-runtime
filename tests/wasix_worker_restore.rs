@@ -12,7 +12,8 @@ use std::{
 
 use runtrue_wasm_runtime::{
     CheckpointAuthenticationKey, Error, WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION,
-    WasixCheckpointBinding, WasixCheckpointCodec, WasixWorkerConfig, restore_wasix_checkpoint,
+    WasixCheckpointBinding, WasixCheckpointCodec, WasixCheckpointRestoreFailureReason,
+    WasixCheckpointRestorePhase, WasixWorkerConfig, restore_wasix_checkpoint,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
@@ -61,6 +62,8 @@ async fn restores_the_source_argument_in_a_fresh_destination_worker() {
     .expect("destination worker must restore the authenticated checkpoint");
 
     assert_eq!(metadata.stdout, format!("{VALUE}\n").as_bytes());
+    assert_eq!(metadata.stderr, format!("{VALUE}\n").as_bytes());
+    assert!(metadata.worker_diagnostics.is_empty());
     assert_eq!(metadata.binding, binding);
     assert_eq!(metadata.module_sha256, module_sha256);
     assert_eq!(metadata.journal_sha256, journal_sha256);
@@ -172,6 +175,7 @@ async fn restore_waits_for_execute_authorization() {
     let completion: serde_json::Value = serde_json::from_slice(&read_test_frame(&mut stdout).await)
         .expect("restore completion must decode");
     let output = read_test_frame(&mut stdout).await;
+    let error_output = read_test_frame(&mut stdout).await;
     assert_eq!(completion["exitCode"], 0);
     assert_eq!(completion["stdoutBytes"], output.len());
     assert_eq!(
@@ -179,6 +183,12 @@ async fn restore_waits_for_execute_authorization() {
         hex::encode(Sha256::digest(&output))
     );
     assert_eq!(output, format!("{VALUE}\n").as_bytes());
+    assert_eq!(completion["stderrBytes"], error_output.len());
+    assert_eq!(
+        completion["stderrSha256"],
+        hex::encode(Sha256::digest(&error_output))
+    );
+    assert_eq!(error_output, format!("{VALUE}\n").as_bytes());
 
     let mut trailing = [0_u8; 1];
     assert_eq!(
@@ -195,6 +205,51 @@ async fn restore_waits_for_execute_authorization() {
             .expect("restore worker must be waitable")
             .success()
     );
+}
+
+#[tokio::test]
+async fn reports_bounded_redacted_worker_diagnostics_for_restore_failure() {
+    let journal = tokio::task::spawn_blocking(capture_checkpoint_prefix)
+        .await
+        .expect("source checkpoint capture must be joinable");
+    let other_module = wat::parse_str("(module (func (export \"_start\")))")
+        .expect("diagnostic fixture must compile to WebAssembly");
+    let binding = WasixCheckpointBinding::new(
+        format!("sha256:{}", "1".repeat(64)),
+        hex::encode(Sha256::digest(&other_module)),
+        "_start",
+        "destination-diagnostic-test",
+        1,
+    )
+    .expect("diagnostic binding must be valid");
+    let checkpoint = authenticated_checkpoint(&binding, &journal);
+
+    let error = restore_wasix_checkpoint(
+        &WasixWorkerConfig::new(WORKER)
+            .with_handshake_timeout(Duration::from_secs(30))
+            .with_allowed_supplementary_groups(expected_worker_groups()),
+        checkpoint,
+        other_module,
+    )
+    .await
+    .expect_err("a journal captured from another module must fail in the worker");
+
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    let Error::CheckpointRestore(failure) = error else {
+        panic!("restore failure must retain its structured phase: {error:?}");
+    };
+    assert_eq!(failure.phase(), WasixCheckpointRestorePhase::Execution);
+    assert_eq!(
+        failure.reason(),
+        WasixCheckpointRestoreFailureReason::Runtime
+    );
+    assert!(!failure.diagnostics().is_empty());
+    assert!(!failure.diagnostics().is_truncated());
+    let diagnostics = String::from_utf8_lossy(failure.diagnostics().as_bytes());
+    assert!(diagnostics.contains("restore journal module hash does not match"));
+    assert!(!display.contains("restore journal module hash"));
+    assert!(!debug.contains("restore journal module hash"));
 }
 
 fn capture_checkpoint_prefix() -> Vec<u8> {

@@ -40,4 +40,4 @@ SHA-256 is `d27c3e2904499dc70ef601009763dd8867adc811320cdbedce2628a1635fdbbf`.
 with Rust 1.94.0's `wasm32-unknown-unknown` target, then transformed with
 Binaryen `version_131` Asyncify. Binaryen is licensed under Apache-2.0. The
 fixture's SHA-256 is
-`8be7489cc7ab13ea4c33cf7d6547a6a9ba00da257baf12b803caef29bb63698a`.
+`7cfd4555fa35e66769b6285557533157975bcb0dfd974d387502dd147dc491ed`.

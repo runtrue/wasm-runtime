@@ -32,7 +32,7 @@ inside this OS boundary. Neither layer replaces the other.
 
 ## WASIX worker startup
 
-Worker protocol version 7 requires Linux 5.6 or newer. Install the
+Worker protocol version 8 requires Linux 5.6 or newer. Install the
 `runtrue-wasix-worker` executable as a nonempty regular file. The file and every
 directory in its configured absolute path must be owned by root or the host
 process's effective user ID. Neither the file nor an ancestor may be group- or

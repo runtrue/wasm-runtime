@@ -62,6 +62,8 @@ async fn moves_a_checkpoint_from_one_worker_to_another() {
     assert_ne!(source_process_id, std::process::id());
     assert_ne!(destination.worker.process_id, std::process::id());
     assert_eq!(destination.stdout, b"424242\n");
+    assert_eq!(destination.stderr, b"424242\n");
+    assert!(destination.worker_diagnostics.is_empty());
     assert_eq!(destination.binding, binding);
     assert_eq!(destination.module_sha256, module_sha256);
     assert_eq!(destination.journal_sha256, journal_sha256);

@@ -81,6 +81,7 @@ pub extern "C" fn _start() {
     };
     let mut written = 0;
     let _ = unsafe { fd_write(1, &raw const iovec, 1, &raw mut written) };
+    let _ = unsafe { fd_write(2, &raw const iovec, 1, &raw mut written) };
 }
 
 #[panic_handler]

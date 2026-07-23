@@ -28,7 +28,10 @@ pub use environment::{
     EnvironmentArtifact, EnvironmentBuild, EnvironmentCommands, EnvironmentFilesystem,
     EnvironmentLanguage, EnvironmentManifest,
 };
-pub use error::{Error, Result};
+pub use error::{
+    Error, Result, WasixCheckpointRestoreFailure, WasixCheckpointRestoreFailureReason,
+    WasixCheckpointRestorePhase, WasixWorkerDiagnostics,
+};
 pub use http::{
     HttpDispatchMetadata, HttpRequest, HttpResponse, HttpService, HttpServiceConfig,
     HttpServiceMetrics, HttpServiceState, OutboundHttpGrant, StreamingHttpBody,

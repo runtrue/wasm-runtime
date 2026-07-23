@@ -66,10 +66,12 @@ fn run_fixture(
         .hash()
         .expect("compiled fixture must retain its content hash");
     let mut builder = WasiEnvBuilder::new("wasix-checkpoint-number");
+    let (stderr, _stderr_output) = Pipe::channel();
     builder.set_runtime(runtime.clone());
     builder.set_module_hash(module_hash);
     builder.add_args(arguments.iter().copied());
     builder.set_stdout(Box::new(stdout));
+    builder.set_stderr(Box::new(stderr));
     builder.with_skip_stdio_during_bootstrap(true);
     if stop_after_explicit_snapshot {
         builder.add_snapshot_trigger(SnapshotTrigger::Explicit);
