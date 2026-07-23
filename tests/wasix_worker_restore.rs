@@ -11,7 +11,7 @@ use std::{
 };
 
 use runtrue_wasm_runtime::{
-    CheckpointAuthenticationKey, WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION,
+    CheckpointAuthenticationKey, Error, WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION,
     WasixCheckpointBinding, WasixCheckpointCodec, WasixWorkerConfig, restore_wasix_checkpoint,
 };
 use sha2::{Digest as _, Sha256};
@@ -71,6 +71,34 @@ async fn restores_the_source_argument_in_a_fresh_destination_worker() {
     assert_ne!(metadata.worker.process_id, std::process::id());
     assert!(metadata.worker.isolation.no_new_privileges);
     assert_eq!(metadata.worker.isolation.capability_masks, [0; 4]);
+}
+
+#[tokio::test]
+async fn rejects_a_checkpoint_from_a_different_worker_build() {
+    let journal = tokio::task::spawn_blocking(capture_checkpoint_prefix)
+        .await
+        .expect("source checkpoint capture must be joinable");
+    let binding = WasixCheckpointBinding::new(
+        format!("sha256:{}", "1".repeat(64)),
+        hex::encode(Sha256::digest(FIXTURE)),
+        "_start",
+        "different-worker-build-test",
+        1,
+    )
+    .expect("fixture binding must be valid");
+    let checkpoint = authenticated_checkpoint_for_worker(&binding, &journal, &"0".repeat(64));
+
+    let error = restore_wasix_checkpoint(
+        &WasixWorkerConfig::new(WORKER).with_allowed_supplementary_groups(expected_worker_groups()),
+        checkpoint,
+        FIXTURE.to_vec(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::Checkpoint(message) if message.contains("worker build")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -283,6 +311,14 @@ fn authenticated_checkpoint(
     binding: &WasixCheckpointBinding,
     journal: &[u8],
 ) -> runtrue_wasm_runtime::VerifiedWasixCheckpoint {
+    authenticated_checkpoint_for_worker(binding, journal, &worker_build_sha256())
+}
+
+fn authenticated_checkpoint_for_worker(
+    binding: &WasixCheckpointBinding,
+    journal: &[u8],
+    worker_build_sha256: &str,
+) -> runtrue_wasm_runtime::VerifiedWasixCheckpoint {
     use hmac::{Hmac, Mac as _};
 
     type HmacSha256 = Hmac<Sha256>;
@@ -291,6 +327,7 @@ fn authenticated_checkpoint(
         "runtimeVersion": env!("CARGO_PKG_VERSION"),
         "workerProtocolVersion": WASIX_WORKER_PROTOCOL_VERSION,
         "cohortId": WASIX_COHORT_ID,
+        "workerBuildSha256": worker_build_sha256,
         "engineProfile": "runtrue-wasix-engine-v1",
         "platform": format!(
             "{};endian={};pointer={}",
@@ -307,7 +344,7 @@ fn authenticated_checkpoint(
     .expect("checkpoint metadata must encode");
     let mut artifact = Vec::new();
     artifact.extend_from_slice(b"RTWCPKT\0");
-    artifact.extend_from_slice(&1_u16.to_be_bytes());
+    artifact.extend_from_slice(&2_u16.to_be_bytes());
     artifact.extend_from_slice(
         &u32::try_from(metadata.len())
             .expect("metadata length must fit u32")
@@ -321,13 +358,19 @@ fn authenticated_checkpoint(
     artifact.extend_from_slice(&metadata);
     artifact.extend_from_slice(journal);
     let mut mac = HmacSha256::new_from_slice(&[7; 32]).expect("HMAC key must be valid");
-    mac.update(b"runtrue-wasm-runtime.wasix-checkpoint.v1\0");
+    mac.update(b"runtrue-wasm-runtime.wasix-checkpoint.v2\0");
     mac.update(&artifact);
     artifact.extend_from_slice(&mac.finalize().into_bytes());
 
     WasixCheckpointCodec::new(CheckpointAuthenticationKey::new([7; 32]))
         .open(binding, &artifact)
         .expect("real captured checkpoint must authenticate and validate")
+}
+
+fn worker_build_sha256() -> String {
+    hex::encode(Sha256::digest(
+        std::fs::read(WORKER).expect("worker executable must be readable"),
+    ))
 }
 
 fn expected_worker_groups() -> Vec<u32> {

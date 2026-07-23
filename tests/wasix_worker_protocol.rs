@@ -16,12 +16,12 @@ const WORKER: &str = env!("CARGO_BIN_EXE_runtrue-wasix-worker");
 #[tokio::test]
 async fn validates_the_explicit_worker_build_and_fresh_process() {
     let expected_groups = expected_worker_groups();
-    let config = WasixWorkerConfig::new(WORKER)
-        .with_allowed_supplementary_groups(expected_groups.iter().copied());
+    let config = worker_config().with_allowed_supplementary_groups(expected_groups.iter().copied());
     let metadata = probe_wasix_worker(&config).await.unwrap();
     assert_eq!(metadata.protocol_version, WASIX_WORKER_PROTOCOL_VERSION);
     assert_eq!(metadata.runtime_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(metadata.cohort_id, WASIX_COHORT_ID);
+    assert_eq!(metadata.worker_build_sha256, worker_build_sha256());
     assert_ne!(metadata.process_id, std::process::id());
     let isolation = metadata.isolation;
     assert_eq!(isolation.profile_version, 2);
@@ -51,12 +51,9 @@ async fn transports_verified_journal_through_sealed_stdin() {
     let expected_binding = checkpoint.binding().clone();
     let expected_bytes = u64::try_from(checkpoint.journal().len()).unwrap();
     let expected_sha256 = hex::encode(Sha256::digest(checkpoint.journal()));
-    let metadata = probe_wasix_checkpoint_transport(
-        &WasixWorkerConfig::new(WORKER).with_allowed_supplementary_groups(expected_worker_groups()),
-        checkpoint,
-    )
-    .await
-    .unwrap();
+    let metadata = probe_wasix_checkpoint_transport(&worker_config(), checkpoint)
+        .await
+        .unwrap();
 
     assert_eq!(metadata.binding, expected_binding);
     assert_eq!(metadata.journal_bytes, expected_bytes);
@@ -164,11 +161,7 @@ async fn sealed_input_is_immutable_and_worker_uses_positional_reads() {
 async fn closes_inherited_host_descriptors_before_ready() {
     let sentinel = tempfile::tempfile().unwrap();
     rustix::io::fcntl_setfd(&sentinel, rustix::io::FdFlags::empty()).unwrap();
-    let metadata = probe_wasix_worker(
-        &WasixWorkerConfig::new(WORKER).with_allowed_supplementary_groups(expected_worker_groups()),
-    )
-    .await
-    .unwrap();
+    let metadata = probe_wasix_worker(&worker_config()).await.unwrap();
     assert!(metadata.isolation.closed_inherited_descriptor_count >= 1);
 }
 
@@ -191,13 +184,66 @@ async fn rejects_implicit_and_non_worker_executables() {
 #[cfg(unix)]
 #[tokio::test]
 async fn rejects_symlinked_worker_paths() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = safe_worker_test_directory();
     let link = directory.path().join("worker");
     std::os::unix::fs::symlink(WORKER, &link).unwrap();
     let error = probe_wasix_worker(&WasixWorkerConfig::new(link))
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Configuration(_)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_symlinked_worker_ancestors() {
+    let directory = safe_worker_test_directory();
+    let real = directory.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let worker = real.join("worker");
+    std::fs::copy(WORKER, &worker).unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+    let error = probe_wasix_worker(&WasixWorkerConfig::new(alias.join("worker")))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Configuration(_)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_group_or_world_writable_worker_executables() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = safe_worker_test_directory();
+    let worker = directory.path().join("worker");
+    std::fs::copy(WORKER, &worker).unwrap();
+    for mode in [0o720, 0o702] {
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(mode)).unwrap();
+        let error = probe_wasix_worker(&WasixWorkerConfig::new(&worker))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Configuration(_)), "mode {mode:o}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejects_group_or_world_writable_worker_ancestors() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = safe_worker_test_directory();
+    let unsafe_parent = directory.path().join("unsafe");
+    std::fs::create_dir(&unsafe_parent).unwrap();
+    let worker = unsafe_parent.join("worker");
+    std::fs::copy(WORKER, &worker).unwrap();
+    for mode in [0o770, 0o707] {
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        let error = probe_wasix_worker(&WasixWorkerConfig::new(&worker))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Configuration(_)), "mode {mode:o}");
+    }
 }
 
 #[tokio::test]
@@ -246,9 +292,8 @@ async fn placement_runs_for_the_spawned_worker_before_success() {
 
     let observed = Arc::new(Mutex::new(None));
     let placement_observed = Arc::clone(&observed);
-    let config = WasixWorkerConfig::new(WORKER)
-        .with_allowed_supplementary_groups(expected_worker_groups())
-        .with_worker_placement(move |request: WasixWorkerPlacementRequest| {
+    let config =
+        worker_config().with_worker_placement(move |request: WasixWorkerPlacementRequest| {
             assert_eq!(request.operation(), WasixWorkerOperation::Probe);
             assert!(
                 std::path::Path::new(&format!("/proc/{}/status", request.process_id())).exists()
@@ -266,7 +311,7 @@ async fn placement_runs_for_the_spawned_worker_before_success() {
 async fn placement_rejection_precedes_checkpoint_input() {
     use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = safe_worker_test_directory();
     let worker = directory.path().join("input-observer");
     let temporary_input = directory.path().join("input.pending");
     let received_input = directory.path().join("input.received");
@@ -303,7 +348,10 @@ async fn placement_rejection_precedes_checkpoint_input() {
             Err(Error::Configuration("test placement rejection".to_owned()))
         });
 
-    let error = probe_wasix_checkpoint_transport(&config, verified_transport_checkpoint())
+    let worker_build_sha256 =
+        hex::encode(Sha256::digest(std::fs::read(config.executable()).unwrap()));
+    let checkpoint = verified_transport_checkpoint_for_build(&worker_build_sha256);
+    let error = probe_wasix_checkpoint_transport(&config, checkpoint)
         .await
         .unwrap_err();
     assert!(
@@ -327,10 +375,10 @@ fn parent_death_helper_process() {
 }
 
 #[tokio::test]
-async fn worker_dies_when_its_parent_process_is_lost() {
+async fn descriptor_executed_worker_dies_when_its_parent_process_is_lost() {
     use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = safe_worker_test_directory();
     let worker = directory.path().join("parent-death-worker");
     let worker_pid_file = directory.path().join("worker.pid");
     let mut executable = std::fs::OpenOptions::new()
@@ -377,7 +425,7 @@ fn forking_worker() -> (
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = safe_worker_test_directory();
     let worker = directory.path().join("forking-worker");
     let worker_file = directory.path().join("worker.pid");
     let descendant_file = directory.path().join("descendant.pid");
@@ -398,6 +446,14 @@ fn forking_worker() -> (
     std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::thread::sleep(Duration::from_millis(50));
     (directory, worker, worker_file, descendant_file)
+}
+
+#[cfg(unix)]
+fn safe_worker_test_directory() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("runtrue-worker-test-")
+        .tempdir_in(std::path::Path::new(WORKER).parent().unwrap())
+        .unwrap()
 }
 
 #[cfg(unix)]
@@ -439,7 +495,20 @@ fn expected_worker_groups() -> Vec<u32> {
     groups
 }
 
+fn worker_config() -> WasixWorkerConfig {
+    WasixWorkerConfig::new(WORKER)
+        .with_handshake_timeout(Duration::from_secs(30))
+        .with_allowed_supplementary_groups(expected_worker_groups())
+}
+
 fn verified_transport_checkpoint() -> runtrue_wasm_runtime::VerifiedWasixCheckpoint {
+    let worker_build_sha256 = worker_build_sha256();
+    verified_transport_checkpoint_for_build(&worker_build_sha256)
+}
+
+fn verified_transport_checkpoint_for_build(
+    worker_build_sha256: &str,
+) -> runtrue_wasm_runtime::VerifiedWasixCheckpoint {
     use hmac::{Hmac, Mac as _};
 
     type HmacSha256 = Hmac<Sha256>;
@@ -468,6 +537,7 @@ fn verified_transport_checkpoint() -> runtrue_wasm_runtime::VerifiedWasixCheckpo
         "runtimeVersion": env!("CARGO_PKG_VERSION"),
         "workerProtocolVersion": WASIX_WORKER_PROTOCOL_VERSION,
         "cohortId": WASIX_COHORT_ID,
+        "workerBuildSha256": worker_build_sha256,
         "engineProfile": "runtrue-wasix-engine-v1",
         "platform": format!(
             "{};endian={};pointer={}",
@@ -484,19 +554,23 @@ fn verified_transport_checkpoint() -> runtrue_wasm_runtime::VerifiedWasixCheckpo
     .unwrap();
     let mut artifact = Vec::new();
     artifact.extend_from_slice(b"RTWCPKT\0");
-    artifact.extend_from_slice(&1_u16.to_be_bytes());
+    artifact.extend_from_slice(&2_u16.to_be_bytes());
     artifact.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_be_bytes());
     artifact.extend_from_slice(&u64::try_from(journal.len()).unwrap().to_be_bytes());
     artifact.extend_from_slice(&metadata);
     artifact.extend_from_slice(&journal);
     let mut mac = HmacSha256::new_from_slice(&[7; 32]).unwrap();
-    mac.update(b"runtrue-wasm-runtime.wasix-checkpoint.v1\0");
+    mac.update(b"runtrue-wasm-runtime.wasix-checkpoint.v2\0");
     mac.update(&artifact);
     artifact.extend_from_slice(&mac.finalize().into_bytes());
     WasixCheckpointCodec::new(CheckpointAuthenticationKey::new([7; 32]))
         .with_max_journal_bytes(1024)
         .open(&binding, &artifact)
         .unwrap()
+}
+
+fn worker_build_sha256() -> String {
+    hex::encode(Sha256::digest(std::fs::read(WORKER).unwrap()))
 }
 
 fn push_test_record(journal: &mut Vec<u8>, record_type: u16, body: &[u8]) {

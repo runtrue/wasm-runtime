@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Pin the trusted WASIX worker inode across validation and launch with Linux
+  `openat2` and `execveat`, reject unsafe executable paths and permissions, and
+  authenticate the exact worker build in Ready frames and checkpoint artifacts.
+
 ## [0.1.0-alpha.5] - 2026-07-19
 
 ### Changed
