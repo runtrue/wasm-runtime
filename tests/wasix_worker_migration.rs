@@ -73,6 +73,7 @@ async fn moves_a_checkpoint_from_one_worker_to_another() {
     assert!(destination.worker.isolation.no_new_privileges);
     assert_eq!(source.worker.isolation.capability_masks, [0; 4]);
     assert_eq!(destination.worker.isolation.capability_masks, [0; 4]);
+    println!("RUNTRUE_WASIX_CHECKPOINT_MIGRATION_OK value=424242 workers=distinct");
 }
 
 fn worker_config() -> WasixWorkerConfig {

@@ -107,10 +107,7 @@ jobs:
           shared-key: ci-wasix-checkpoint
 
       - name: Snapshot on source worker and restore on destination worker
-        run: >-
-          cargo test --locked --all-features
-          --test wasix_worker_migration --
-          --exact moves_a_checkpoint_from_one_worker_to_another
+        run: scripts/checkpoint-migration-ci.sh
 
   supply-chain:
     name: Dependency policy and advisories
