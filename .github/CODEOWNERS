@@ -4,3 +4,10 @@
 /docs/security.md @doout
 /src/cache.rs @doout
 /src/http.rs @doout
+
+# Dependabot changes to these files are verified and approved by the
+# Dependabot auto-merge workflow. Other pull requests still need the normal
+# branch-protection approval.
+/Cargo.toml
+/Cargo.lock
+/.github/workflows/
