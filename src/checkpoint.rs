@@ -2,6 +2,8 @@ use crate::{Error, Result, WASIX_COHORT_ID, WASIX_WORKER_PROTOCOL_VERSION};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::io::{Read, Write};
+use std::ops::Range;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -258,6 +260,78 @@ impl WasixCheckpointCodec {
         binding: &WasixCheckpointBinding,
         journal: &CapturedWasixJournal,
     ) -> Result<Vec<u8>> {
+        let prepared = self.prepare_seal(binding, journal)?;
+        let mut artifact = Vec::new();
+        artifact
+            .try_reserve_exact(prepared.artifact_len)
+            .map_err(|error| {
+                Error::Checkpoint(format!(
+                    "checkpoint artifact allocation failed during seal: {error}"
+                ))
+            })?;
+        self.write_prepared_checkpoint(&prepared, &mut artifact)?;
+        Ok(artifact)
+    }
+
+    /// Stream a trusted capture into a versioned artifact.
+    ///
+    /// This is the streaming counterpart to [`Self::seal_capture`] and inherits
+    /// the complete workload identity from the attested capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid capture binding, an empty or oversized
+    /// journal, metadata encoding or allocation failure, or a destination
+    /// write failure.
+    pub fn seal_capture_into<W: Write>(
+        &self,
+        journal: &CapturedWasixJournal,
+        writer: &mut W,
+    ) -> Result<usize> {
+        self.seal_bound_capture_into(&journal.binding, journal, writer)
+    }
+
+    /// Stream a trusted, locally produced journal into a versioned artifact.
+    ///
+    /// This avoids constructing a second, artifact-sized buffer. The writer
+    /// may contain a partial, unauthenticated artifact when an I/O error is
+    /// returned and must discard it in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid binding, an empty or oversized journal,
+    /// metadata encoding or allocation failure, or a destination write failure.
+    pub fn seal_into<W: Write>(
+        &self,
+        binding: &WasixCheckpointBinding,
+        journal: &CapturedWasixJournal,
+        writer: &mut W,
+    ) -> Result<usize> {
+        binding.validate()?;
+        if binding != &journal.binding {
+            return Err(Error::Checkpoint(
+                "captured journal binding does not match the checkpoint binding".to_owned(),
+            ));
+        }
+        self.seal_bound_capture_into(binding, journal, writer)
+    }
+
+    fn seal_bound_capture_into<W: Write>(
+        &self,
+        binding: &WasixCheckpointBinding,
+        journal: &CapturedWasixJournal,
+        writer: &mut W,
+    ) -> Result<usize> {
+        let prepared = self.prepare_seal(binding, journal)?;
+        self.write_prepared_checkpoint(&prepared, writer)?;
+        Ok(prepared.artifact_len)
+    }
+
+    fn prepare_seal<'a>(
+        &self,
+        binding: &WasixCheckpointBinding,
+        journal: &'a CapturedWasixJournal,
+    ) -> Result<PreparedCheckpoint<'a>> {
         self.validate_limit()?;
         binding.validate()?;
         if binding != &journal.binding || !journal.explicit_snapshot {
@@ -273,9 +347,11 @@ impl WasixCheckpointCodec {
             &journal.worker_build_sha256,
             &journal.bytes,
         );
-        let metadata = serde_json::to_vec(&metadata).map_err(|error| {
+        let mut metadata_writer = FallibleBoundedVec::new(MAX_CHECKPOINT_METADATA_BYTES);
+        serde_json::to_writer(&mut metadata_writer, &metadata).map_err(|error| {
             Error::Checkpoint(format!("checkpoint metadata encoding failed: {error}"))
         })?;
+        let metadata = metadata_writer.into_inner();
         if metadata.is_empty() || metadata.len() > MAX_CHECKPOINT_METADATA_BYTES {
             return Err(Error::Checkpoint(
                 "checkpoint metadata exceeds the format limit".to_owned(),
@@ -293,16 +369,33 @@ impl WasixCheckpointCodec {
         let journal_len = u64::try_from(journal.bytes.len())
             .map_err(|_| Error::Checkpoint("checkpoint journal length overflows u64".to_owned()))?;
 
-        let mut artifact = Vec::with_capacity(capacity);
-        artifact.extend_from_slice(CHECKPOINT_MAGIC);
-        artifact.extend_from_slice(&CHECKPOINT_FORMAT_VERSION.to_be_bytes());
-        artifact.extend_from_slice(&metadata_len.to_be_bytes());
-        artifact.extend_from_slice(&journal_len.to_be_bytes());
-        artifact.extend_from_slice(&metadata);
-        artifact.extend_from_slice(&journal.bytes);
-        let tag = self.authentication_tag(&artifact)?.finalize().into_bytes();
-        artifact.extend_from_slice(&tag);
-        Ok(artifact)
+        let mut header = [0_u8; CHECKPOINT_HEADER_BYTES];
+        header[..8].copy_from_slice(CHECKPOINT_MAGIC);
+        header[8..10].copy_from_slice(&CHECKPOINT_FORMAT_VERSION.to_be_bytes());
+        header[10..14].copy_from_slice(&metadata_len.to_be_bytes());
+        header[14..22].copy_from_slice(&journal_len.to_be_bytes());
+
+        Ok(PreparedCheckpoint {
+            header,
+            metadata,
+            journal: &journal.bytes,
+            artifact_len: capacity,
+        })
+    }
+
+    fn write_prepared_checkpoint<W: Write>(
+        &self,
+        prepared: &PreparedCheckpoint<'_>,
+        writer: &mut W,
+    ) -> Result<()> {
+        let mut mac = self.authentication_state()?;
+        write_authenticated_chunk(writer, &mut mac, &prepared.header, "header")?;
+        write_authenticated_chunk(writer, &mut mac, &prepared.metadata, "metadata")?;
+        write_authenticated_chunk(writer, &mut mac, prepared.journal, "journal")?;
+        let tag = mac.finalize().into_bytes();
+        writer.write_all(&tag).map_err(|error| {
+            Error::Checkpoint(format!("checkpoint artifact tag write failed: {error}"))
+        })
     }
 
     /// Authenticate and validate a checkpoint before exposing its journal.
@@ -321,13 +414,119 @@ impl WasixCheckpointCodec {
         expected_binding: &WasixCheckpointBinding,
         artifact: &[u8],
     ) -> Result<VerifiedWasixCheckpoint> {
+        let parts = self.verify_parts(expected_binding, artifact)?;
+        let journal = &artifact[parts.journal.clone()];
+        let mut journal_copy = Vec::new();
+        journal_copy
+            .try_reserve_exact(journal.len())
+            .map_err(|error| {
+                Error::Checkpoint(format!(
+                    "checkpoint journal allocation failed during open: {error}"
+                ))
+            })?;
+        journal_copy.extend_from_slice(journal);
+
+        Ok(VerifiedWasixCheckpoint {
+            binding: parts.binding,
+            bytes: journal_copy,
+            journal: 0..journal.len(),
+            artifact_sha256: parts.artifact_sha256,
+            worker_build_sha256: parts.worker_build_sha256,
+        })
+    }
+
+    /// Authenticate an in-memory artifact without copying its journal.
+    ///
+    /// The returned view borrows the artifact and is valid only while the
+    /// artifact remains unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed framing, an unsupported format,
+    /// authentication failure, incompatible identity, or an invalid digest.
+    pub fn verify<'a>(
+        &self,
+        expected_binding: &WasixCheckpointBinding,
+        artifact: &'a [u8],
+    ) -> Result<VerifiedWasixCheckpointView<'a>> {
+        let parts = self.verify_parts(expected_binding, artifact)?;
+        Ok(VerifiedWasixCheckpointView {
+            binding: parts.binding,
+            journal: &artifact[parts.journal],
+            artifact_sha256: parts.artifact_sha256,
+            worker_build_sha256: parts.worker_build_sha256,
+        })
+    }
+
+    /// Read, authenticate, and validate a bounded checkpoint stream.
+    ///
+    /// The fixed header is validated before one exact, fallible allocation is
+    /// made for the declared artifact length. The verified value retains that
+    /// buffer, avoiding both growth reallocations and a second journal-sized
+    /// allocation and copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a source read or allocation failure, input beyond
+    /// the configured artifact limit, malformed framing, failed authentication,
+    /// incompatible identity, or an invalid digest.
+    pub fn open_reader<R: Read>(
+        &self,
+        expected_binding: &WasixCheckpointBinding,
+        mut reader: R,
+    ) -> Result<VerifiedWasixCheckpoint> {
         self.validate_limit()?;
         expected_binding.validate()?;
-        let maximum_artifact_bytes = CHECKPOINT_HEADER_BYTES
-            .checked_add(MAX_CHECKPOINT_METADATA_BYTES)
-            .and_then(|length| length.checked_add(self.max_journal_bytes))
-            .and_then(|length| length.checked_add(CHECKPOINT_TAG_BYTES))
-            .ok_or_else(|| Error::Checkpoint("checkpoint length overflows usize".to_owned()))?;
+        let maximum_artifact_bytes = self.maximum_artifact_bytes()?;
+        let mut header = [0_u8; CHECKPOINT_HEADER_BYTES];
+        read_checkpoint_exact(&mut reader, &mut header, "header")?;
+        let layout = self.validate_header(&header)?;
+
+        let mut artifact = Vec::new();
+        artifact
+            .try_reserve_exact(layout.artifact_len)
+            .map_err(|error| {
+                Error::Checkpoint(format!(
+                    "checkpoint artifact allocation failed while reading: {error}"
+                ))
+            })?;
+        artifact.extend_from_slice(&header);
+        artifact.resize(layout.artifact_len, 0);
+        read_checkpoint_exact(
+            &mut reader,
+            &mut artifact[CHECKPOINT_HEADER_BYTES..],
+            "body",
+        )?;
+
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = read_checkpoint_trailing_byte(&mut reader, &mut trailing)?;
+        if trailing_bytes != 0 {
+            let message = if layout.artifact_len == maximum_artifact_bytes {
+                "checkpoint artifact exceeds the configured limit while reading"
+            } else {
+                "checkpoint artifact length does not match its header"
+            };
+            return Err(Error::Checkpoint(message.to_owned()));
+        }
+
+        let parts = self.verify_parts(expected_binding, &artifact)?;
+        Ok(VerifiedWasixCheckpoint {
+            binding: parts.binding,
+            bytes: artifact,
+            journal: parts.journal,
+            artifact_sha256: parts.artifact_sha256,
+            worker_build_sha256: parts.worker_build_sha256,
+        })
+    }
+
+    fn verify_parts(
+        &self,
+        expected_binding: &WasixCheckpointBinding,
+        artifact: &[u8],
+    ) -> Result<VerifiedCheckpointParts> {
+        self.validate_limit()?;
+        expected_binding.validate()?;
+        let maximum_artifact_bytes = self.maximum_artifact_bytes()?;
         if artifact.len() > maximum_artifact_bytes {
             return Err(Error::Checkpoint(
                 "checkpoint artifact exceeds the configured limit".to_owned(),
@@ -342,6 +541,45 @@ impl WasixCheckpointCodec {
             .get(..CHECKPOINT_HEADER_BYTES)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| Error::Checkpoint("checkpoint artifact is truncated".to_owned()))?;
+        let layout = self.validate_header(header)?;
+        if artifact.len() != layout.artifact_len {
+            return Err(Error::Checkpoint(
+                "checkpoint artifact length does not match its header".to_owned(),
+            ));
+        }
+
+        let authenticated_len = layout.authenticated_len;
+        let supplied_tag = &artifact[authenticated_len..];
+        self.authentication_tag(&artifact[..authenticated_len])?
+            .verify_slice(supplied_tag)
+            .map_err(|_| Error::Checkpoint("checkpoint authentication failed".to_owned()))?;
+
+        let metadata_end = layout.metadata_end;
+        let metadata: CheckpointMetadata = serde_json::from_slice(
+            &artifact[CHECKPOINT_HEADER_BYTES..metadata_end],
+        )
+        .map_err(|error| Error::Checkpoint(format!("checkpoint metadata is malformed: {error}")))?;
+        metadata.validate(expected_binding)?;
+        let journal = &artifact[metadata_end..authenticated_len];
+        if metadata.journal_sha256 != hex::encode(Sha256::digest(journal)) {
+            return Err(Error::Checkpoint(
+                "checkpoint journal digest is invalid".to_owned(),
+            ));
+        }
+        scan_journal(journal)?;
+
+        Ok(VerifiedCheckpointParts {
+            binding: metadata.binding,
+            journal: metadata_end..authenticated_len,
+            artifact_sha256: hex::encode(Sha256::digest(artifact)),
+            worker_build_sha256: metadata.worker_build_sha256,
+        })
+    }
+
+    fn validate_header(
+        &self,
+        header: &[u8; CHECKPOINT_HEADER_BYTES],
+    ) -> Result<CheckpointArtifactLayout> {
         if &header[..CHECKPOINT_MAGIC.len()] != CHECKPOINT_MAGIC {
             return Err(Error::Checkpoint(
                 "checkpoint artifact magic is invalid".to_owned(),
@@ -372,44 +610,28 @@ impl WasixCheckpointCodec {
         })?;
         self.validate_journal_length(journal_len)?;
 
-        let authenticated_len = CHECKPOINT_HEADER_BYTES
+        let metadata_end = CHECKPOINT_HEADER_BYTES
             .checked_add(metadata_len)
-            .and_then(|length| length.checked_add(journal_len))
             .ok_or_else(|| Error::Checkpoint("checkpoint length overflows usize".to_owned()))?;
-        let expected_len = authenticated_len
+        let authenticated_len = metadata_end
+            .checked_add(journal_len)
+            .ok_or_else(|| Error::Checkpoint("checkpoint length overflows usize".to_owned()))?;
+        let artifact_len = authenticated_len
             .checked_add(CHECKPOINT_TAG_BYTES)
             .ok_or_else(|| Error::Checkpoint("checkpoint length overflows usize".to_owned()))?;
-        if artifact.len() != expected_len {
-            return Err(Error::Checkpoint(
-                "checkpoint artifact length does not match its header".to_owned(),
-            ));
-        }
-
-        let supplied_tag = &artifact[authenticated_len..];
-        self.authentication_tag(&artifact[..authenticated_len])?
-            .verify_slice(supplied_tag)
-            .map_err(|_| Error::Checkpoint("checkpoint authentication failed".to_owned()))?;
-
-        let metadata_end = CHECKPOINT_HEADER_BYTES + metadata_len;
-        let metadata: CheckpointMetadata = serde_json::from_slice(
-            &artifact[CHECKPOINT_HEADER_BYTES..metadata_end],
-        )
-        .map_err(|error| Error::Checkpoint(format!("checkpoint metadata is malformed: {error}")))?;
-        metadata.validate(expected_binding)?;
-        let journal = &artifact[metadata_end..authenticated_len];
-        if metadata.journal_sha256 != hex::encode(Sha256::digest(journal)) {
-            return Err(Error::Checkpoint(
-                "checkpoint journal digest is invalid".to_owned(),
-            ));
-        }
-        scan_journal(journal)?;
-
-        Ok(VerifiedWasixCheckpoint {
-            binding: metadata.binding,
-            journal: journal.to_vec(),
-            artifact_sha256: hex::encode(Sha256::digest(artifact)),
-            worker_build_sha256: metadata.worker_build_sha256,
+        Ok(CheckpointArtifactLayout {
+            metadata_end,
+            authenticated_len,
+            artifact_len,
         })
+    }
+
+    fn maximum_artifact_bytes(&self) -> Result<usize> {
+        CHECKPOINT_HEADER_BYTES
+            .checked_add(MAX_CHECKPOINT_METADATA_BYTES)
+            .and_then(|length| length.checked_add(self.max_journal_bytes))
+            .and_then(|length| length.checked_add(CHECKPOINT_TAG_BYTES))
+            .ok_or_else(|| Error::Checkpoint("checkpoint length overflows usize".to_owned()))
     }
 
     fn validate_limit(&self) -> Result<()> {
@@ -436,19 +658,124 @@ impl WasixCheckpointCodec {
     }
 
     fn authentication_tag(&self, bytes: &[u8]) -> Result<HmacSha256> {
+        let mut mac = self.authentication_state()?;
+        mac.update(bytes);
+        Ok(mac)
+    }
+
+    fn authentication_state(&self) -> Result<HmacSha256> {
         let mut mac = HmacSha256::new_from_slice(&self.authentication_key.0).map_err(|_| {
             Error::Checkpoint("checkpoint authentication key is invalid".to_owned())
         })?;
         mac.update(CHECKPOINT_DOMAIN);
-        mac.update(bytes);
         Ok(mac)
+    }
+}
+
+struct PreparedCheckpoint<'a> {
+    header: [u8; CHECKPOINT_HEADER_BYTES],
+    metadata: Vec<u8>,
+    journal: &'a [u8],
+    artifact_len: usize,
+}
+
+struct VerifiedCheckpointParts {
+    binding: WasixCheckpointBinding,
+    journal: Range<usize>,
+    artifact_sha256: String,
+    worker_build_sha256: String,
+}
+
+struct CheckpointArtifactLayout {
+    metadata_end: usize,
+    authenticated_len: usize,
+    artifact_len: usize,
+}
+
+struct FallibleBoundedVec {
+    bytes: Vec<u8>,
+    maximum_bytes: usize,
+}
+
+impl FallibleBoundedVec {
+    const fn new(maximum_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum_bytes,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for FallibleBoundedVec {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let new_len = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("metadata length overflows usize"))?;
+        if new_len > self.maximum_bytes {
+            return Err(std::io::Error::other(
+                "metadata exceeds the checkpoint format limit",
+            ));
+        }
+        self.bytes.try_reserve_exact(bytes.len()).map_err(|error| {
+            std::io::Error::other(format!("metadata allocation failed: {error}"))
+        })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_authenticated_chunk<W: Write>(
+    writer: &mut W,
+    mac: &mut HmacSha256,
+    bytes: &[u8],
+    phase: &str,
+) -> Result<()> {
+    writer.write_all(bytes).map_err(|error| {
+        Error::Checkpoint(format!("checkpoint artifact {phase} write failed: {error}"))
+    })?;
+    mac.update(bytes);
+    Ok(())
+}
+
+fn read_checkpoint_exact<R: Read>(reader: &mut R, bytes: &mut [u8], phase: &str) -> Result<()> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Checkpoint("checkpoint artifact is truncated".to_owned())
+        } else {
+            Error::Checkpoint(format!("checkpoint artifact {phase} read failed: {error}"))
+        }
+    })
+}
+
+fn read_checkpoint_trailing_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> Result<usize> {
+    loop {
+        match reader.read(byte) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(Error::Checkpoint(format!(
+                    "checkpoint artifact trailing-byte check failed: {error}"
+                )));
+            }
+        }
     }
 }
 
 /// Journal bytes from a fully authenticated and compatibility-checked artifact.
 pub struct VerifiedWasixCheckpoint {
     binding: WasixCheckpointBinding,
-    journal: Vec<u8>,
+    bytes: Vec<u8>,
+    journal: Range<usize>,
     artifact_sha256: String,
     worker_build_sha256: String,
 }
@@ -458,6 +785,7 @@ impl std::fmt::Debug for VerifiedWasixCheckpoint {
         formatter
             .debug_struct("VerifiedWasixCheckpoint")
             .field("binding", &self.binding)
+            .field("backing_bytes", &self.bytes.len())
             .field("journal_bytes", &self.journal.len())
             .field("artifact_sha256", &self.artifact_sha256)
             .field("worker_build_sha256", &self.worker_build_sha256)
@@ -475,7 +803,7 @@ impl VerifiedWasixCheckpoint {
     /// Authenticated Wasmer journal bytes.
     #[must_use]
     pub fn journal(&self) -> &[u8] {
-        &self.journal
+        &self.bytes[self.journal.clone()]
     }
 
     /// Lowercase SHA-256 digest of the complete sealed artifact.
@@ -491,7 +819,58 @@ impl VerifiedWasixCheckpoint {
     }
 
     pub(crate) fn into_parts(self) -> (Vec<u8>, String) {
-        (self.journal, self.worker_build_sha256)
+        let mut bytes = self.bytes;
+        if self.journal.start != 0 {
+            bytes.copy_within(self.journal.clone(), 0);
+        }
+        bytes.truncate(self.journal.len());
+        (bytes, self.worker_build_sha256)
+    }
+}
+
+/// Borrowed journal view from a fully authenticated checkpoint artifact.
+pub struct VerifiedWasixCheckpointView<'a> {
+    binding: WasixCheckpointBinding,
+    journal: &'a [u8],
+    artifact_sha256: String,
+    worker_build_sha256: String,
+}
+
+impl std::fmt::Debug for VerifiedWasixCheckpointView<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedWasixCheckpointView")
+            .field("binding", &self.binding)
+            .field("journal_bytes", &self.journal.len())
+            .field("artifact_sha256", &self.artifact_sha256)
+            .field("worker_build_sha256", &self.worker_build_sha256)
+            .finish()
+    }
+}
+
+impl<'a> VerifiedWasixCheckpointView<'a> {
+    /// Workload identity authenticated by the artifact.
+    #[must_use]
+    pub const fn binding(&self) -> &WasixCheckpointBinding {
+        &self.binding
+    }
+
+    /// Authenticated Wasmer journal bytes borrowed from the artifact.
+    #[must_use]
+    pub const fn journal(&self) -> &'a [u8] {
+        self.journal
+    }
+
+    /// Lowercase SHA-256 digest of the complete sealed artifact.
+    #[must_use]
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    /// Lowercase SHA-256 digest of the source worker executable.
+    #[must_use]
+    pub fn worker_build_sha256(&self) -> &str {
+        &self.worker_build_sha256
     }
 }
 
@@ -1011,6 +1390,147 @@ mod tests {
         assert!(scan_journal(&after_snapshot).is_err());
     }
 
+    #[test]
+    fn streaming_seal_and_borrowed_verify_match_legacy_artifact() {
+        let codec = codec();
+        let binding = binding();
+        let captured = captured(valid_journal());
+        let legacy = codec.seal(&binding, &captured).unwrap();
+        let mut streamed = Vec::new();
+
+        let written = codec.seal_capture_into(&captured, &mut streamed).unwrap();
+        assert_eq!(written, legacy.len());
+        assert_eq!(streamed, legacy);
+
+        let metadata_len =
+            usize::try_from(u32::from_be_bytes(legacy[10..14].try_into().unwrap())).unwrap();
+        let journal_start = CHECKPOINT_HEADER_BYTES + metadata_len;
+        let verified = codec.verify(&binding, &legacy).unwrap();
+        assert_eq!(verified.binding(), &binding);
+        assert_eq!(verified.journal(), captured.bytes);
+        assert_eq!(
+            verified.journal().as_ptr(),
+            legacy[journal_start..].as_ptr()
+        );
+        assert_eq!(verified.artifact_sha256().len(), 64);
+    }
+
+    #[test]
+    fn streaming_reader_reuses_its_artifact_allocation_for_the_journal() {
+        let codec = codec();
+        let binding = binding();
+        let expected_journal = valid_journal();
+        let artifact = codec
+            .seal(&binding, &captured(expected_journal.clone()))
+            .unwrap();
+
+        let verified = codec
+            .open_reader(
+                &binding,
+                ChunkedReader {
+                    bytes: &artifact,
+                    cursor: 0,
+                    maximum_read: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(verified.bytes.len(), artifact.len());
+        assert!(verified.journal.start > 0);
+        assert_eq!(verified.journal(), expected_journal);
+
+        let backing_allocation = verified.bytes.as_ptr();
+        let (journal, source_worker_build_sha256) = verified.into_parts();
+        assert_eq!(journal.as_ptr(), backing_allocation);
+        assert_eq!(journal, expected_journal);
+        assert_eq!(source_worker_build_sha256, worker_build_sha256());
+    }
+
+    #[test]
+    fn enforces_stream_boundaries_at_zero_exact_max_over_max_and_truncation() {
+        let maximum_journal_bytes = 128;
+        let codec = codec().with_max_journal_bytes(maximum_journal_bytes);
+        let binding = binding();
+        let exact_journal = journal_with_len(maximum_journal_bytes);
+        let metadata =
+            CheckpointMetadata::current(binding.clone(), &worker_build_sha256(), &exact_journal);
+        let mut metadata = serde_json::to_vec(&metadata).unwrap();
+        metadata.resize(MAX_CHECKPOINT_METADATA_BYTES, b' ');
+        let artifact = envelope(&codec, &metadata, &exact_journal);
+        assert_eq!(artifact.len(), codec.maximum_artifact_bytes().unwrap());
+        let verified = codec
+            .open_reader(&binding, std::io::Cursor::new(&artifact))
+            .unwrap();
+        assert_eq!(verified.journal(), exact_journal);
+
+        assert!(matches!(
+            codec.seal(&binding, &captured(Vec::new())),
+            Err(Error::Checkpoint(message))
+                if message == "checkpoint journal must not be empty"
+        ));
+        let over_journal = captured(journal_with_len(maximum_journal_bytes + 1));
+        assert!(matches!(
+            codec.seal(&binding, &over_journal),
+            Err(Error::Checkpoint(message))
+                if message == "checkpoint journal exceeds the configured limit"
+        ));
+
+        assert!(matches!(
+            codec.open_reader(&binding, std::io::Cursor::new(Vec::<u8>::new())),
+            Err(Error::Checkpoint(message)) if message == "checkpoint artifact is truncated"
+        ));
+        assert!(matches!(
+            codec.open_reader(
+                &binding,
+                std::io::Cursor::new(&artifact[..artifact.len() - 1]),
+            ),
+            Err(Error::Checkpoint(message))
+                if message == "checkpoint artifact is truncated"
+        ));
+
+        let mut oversized = artifact;
+        oversized.push(0);
+        assert!(matches!(
+            codec.open_reader(&binding, std::io::Cursor::new(oversized)),
+            Err(Error::Checkpoint(message))
+                if message == "checkpoint artifact exceeds the configured limit while reading"
+        ));
+    }
+
+    #[test]
+    fn streaming_failures_report_their_io_phase() {
+        let codec = codec();
+        let binding = binding();
+        let captured = captured(valid_journal());
+        let mut writer = FailingWriter {
+            remaining: CHECKPOINT_HEADER_BYTES,
+        };
+        assert!(matches!(
+            codec.seal_into(&binding, &captured, &mut writer),
+            Err(Error::Checkpoint(message))
+                if message.starts_with("checkpoint artifact metadata write failed:")
+        ));
+
+        let reader = FailingReader;
+        assert!(matches!(
+            codec.open_reader(&binding, reader),
+            Err(Error::Checkpoint(message))
+                if message.starts_with("checkpoint artifact header read failed:")
+        ));
+    }
+
+    #[test]
+    fn streaming_seal_does_not_build_an_artifact_sized_write_chunk() {
+        let codec = codec();
+        let binding = binding();
+        let captured = captured(journal_with_len(1024));
+        let mut writer = CountingWriter::default();
+
+        let written = codec.seal_into(&binding, &captured, &mut writer).unwrap();
+        assert_eq!(writer.total_bytes, written);
+        assert_eq!(writer.writes, 4);
+        assert!(writer.largest_write < written);
+    }
+
     fn binding() -> WasixCheckpointBinding {
         WasixCheckpointBinding::new(
             format!("sha256:{}", "1".repeat(64)),
@@ -1034,6 +1554,84 @@ mod tests {
         push_record(&mut journal, 60, &[]);
         push_record(&mut journal, JOURNAL_SNAPSHOT_V1, &[0]);
         journal
+    }
+
+    fn journal_with_len(length: usize) -> Vec<u8> {
+        const FRAMING_BYTES: usize = 42;
+        assert!(length > FRAMING_BYTES);
+        let mut journal = JOURNAL_MAGIC.to_vec();
+        push_record(&mut journal, 1, &vec![0; length - FRAMING_BYTES]);
+        push_record(&mut journal, 3, &[0]);
+        push_record(&mut journal, 60, &[]);
+        push_record(&mut journal, JOURNAL_SNAPSHOT_V1, &[0]);
+        assert_eq!(journal.len(), length);
+        journal
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected read failure"))
+        }
+    }
+
+    struct ChunkedReader<'a> {
+        bytes: &'a [u8],
+        cursor: usize,
+        maximum_read: usize,
+    }
+
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = &self.bytes[self.cursor..];
+            let read = destination
+                .len()
+                .min(self.maximum_read)
+                .min(remaining.len());
+            destination[..read].copy_from_slice(&remaining[..read]);
+            self.cursor += read;
+            Ok(read)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        total_bytes: usize,
+        largest_write: usize,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.total_bytes += bytes.len();
+            self.largest_write = self.largest_write.max(bytes.len());
+            self.writes += 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
