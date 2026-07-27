@@ -53,7 +53,7 @@ webc = { version = "=11.0.0", optional = true, default-features = false, feature
 [dev-dependencies]
 tempfile = "=3.23.0"
 wat = "=1.251.0"
-wit-component = "=0.244.0"
+wit-component = "=0.254.0"
 
 [[bin]]
 name = "runtrue-wasix-worker"
