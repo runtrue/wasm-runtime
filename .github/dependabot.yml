@@ -4,6 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    rebase-strategy: auto
     open-pull-requests-limit: 5
     labels: [dependencies, rust]
     groups:
@@ -16,5 +17,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    rebase-strategy: auto
     open-pull-requests-limit: 5
     labels: [dependencies, github-actions]
