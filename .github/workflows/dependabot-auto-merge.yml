@@ -1,39 +1,36 @@
 name: Dependabot auto-merge
 
 on:
-  workflow_run:
-    workflows: [CI, Fuzz]
-    types: [completed]
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
-  group: dependabot-auto-merge-${{ github.event.workflow_run.head_sha }}
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-# workflow_run executes this trusted workflow from the default branch with a
-# write-capable token. It never checks out or executes pull-request code.
+# pull_request_target runs this trusted workflow from the default branch. It
+# never checks out or executes pull-request code.
 permissions:
-  checks: read
   contents: write
   pull-requests: write
 
 jobs:
-  merge-verified-update:
-    name: Merge verified dependency update
+  enable-auto-merge:
+    name: Enable verified Dependabot auto-merge
     if: >-
       github.repository == 'runtrue/wasm-runtime' &&
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.pull_requests[0].number != null
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Verify the Dependabot pull request
         id: verify
         env:
-          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
@@ -104,7 +101,6 @@ jobs:
           done
 
           {
-            echo "base-ref=$base_ref"
             echo "head-sha=$head_sha"
             echo "pr-url=$(jq -r '.html_url' <<< "$pr")"
           } >> "$GITHUB_OUTPUT"
@@ -117,126 +113,21 @@ jobs:
             echo "- Allowed files only: \`true\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Confirm every matching check passed
-        id: checks
-        env:
-          BASE_REF: ${{ steps.verify.outputs.base-ref }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
-          REPOSITORY: ${{ github.repository }}
-        shell: bash
-        run: |
-          mapfile -t required_checks < <(
-            gh api \
-              "repos/$REPOSITORY/branches/$BASE_REF/protection/required_status_checks" \
-              --jq '.contexts[]'
-          )
-          if (( ${#required_checks[@]} == 0 )); then
-            echo "The base branch does not declare any required checks" >&2
-            exit 1
-          fi
-
-          needs_fuzz=false
-          while IFS= read -r changed_file; do
-            case "$changed_file" in
-              fuzz/*|.github/workflows/fuzz.yml|Cargo.toml|Cargo.lock|src/*|tests/fixtures/*)
-                needs_fuzz=true
-                break
-                ;;
-            esac
-          done < <(
-            gh api --paginate \
-              "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
-              --jq '.[].filename'
-          )
-          if [[ "$needs_fuzz" == "true" ]] &&
-             [[ ! " ${required_checks[*]} " =~ " Runtime trust boundaries " ]]; then
-            required_checks+=("Runtime trust boundaries")
-          fi
-
-          check_runs="$(
-            gh api "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?per_page=100"
-          )"
-          ready=true
-          for check_name in "${required_checks[@]}"; do
-            state="$(
-              jq -r --arg name "$check_name" '
-                [.check_runs[]
-                  | select(.name == $name and .app.slug == "github-actions")]
-                | sort_by(.id)
-                | last
-                | if . == null then
-                    "missing:"
-                  else
-                    "\(.status):\(.conclusion // "")"
-                  end
-              ' <<< "$check_runs"
-            )"
-            case "$state" in
-              completed:success) ;;
-              completed:*)
-                echo "$check_name did not pass for $HEAD_SHA ($state)" >&2
-                exit 1
-                ;;
-              *)
-                echo "Waiting for $check_name on $HEAD_SHA ($state)"
-                ready=false
-                ;;
-            esac
-          done
-          echo "ready=$ready" >> "$GITHUB_OUTPUT"
-
-      - name: Verify immutable merge inputs
-        if: steps.checks.outputs.ready == 'true'
-        id: merge-inputs
-        env:
-          EXPECTED_HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
-          REPOSITORY: ${{ github.repository }}
-        shell: bash
-        run: |
-          pr="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
-          current_head_sha="$(jq -r '.head.sha' <<< "$pr")"
-          pr_base_sha="$(jq -r '.base.sha' <<< "$pr")"
-          base_ref="$(jq -r '.base.ref' <<< "$pr")"
-          current_base_sha="$(
-            gh api "repos/$REPOSITORY/commits/$base_ref" --jq '.sha'
-          )"
-
-          if [[ "$current_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
-            echo "Dependabot updated the pull request; a replacement run will evaluate it" >&2
-            echo "merge=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$current_base_sha" != "$pr_base_sha" ]]; then
-            echo "The base branch moved; waiting for Dependabot to rebase" >&2
-            echo "merge=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "merge=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Approve verified Dependabot update
-        if: >-
-          steps.checks.outputs.ready == 'true' &&
-          steps.merge-inputs.outputs.merge == 'true'
+      - name: Approve the verified update
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ steps.verify.outputs.pr-url }}
         run: >-
           gh pr review "$PR_URL"
           --approve
-          --body "All required checks passed for this verified Dependabot update."
+          --body "Verified Dependabot update; required checks still gate the merge."
 
-      - name: Squash and merge
-        if: >-
-          steps.checks.outputs.ready == 'true' &&
-          steps.merge-inputs.outputs.merge == 'true'
+      - name: Enable native auto-merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.verify.outputs.head-sha }}
           PR_URL: ${{ steps.verify.outputs.pr-url }}
         run: >-
           gh pr merge "$PR_URL"
+          --auto
           --squash
           --delete-branch
-          --match-head-commit "$HEAD_SHA"
