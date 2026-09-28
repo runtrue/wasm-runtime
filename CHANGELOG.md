@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Update Wasmtime to 46.0.3 and patch h2 and rustls to resolve published
+  RustSec advisories in both runtime and fuzz dependencies.
+
 - Pin the trusted WASIX worker inode across validation and launch with Linux
   `openat2` and `execveat`, reject unsafe executable paths and permissions, and
   authenticate the exact worker build in Ready frames and checkpoint artifacts.
