@@ -43,7 +43,8 @@ install -m 0644 \
 
 cd "$workspace/consumer"
 cargo add --quiet --path "$packaged_crate" runtrue-wasm-runtime
-cargo add --quiet tokio@=1.51.1 --features io-util,macros,net,rt-multi-thread
+tokio_requirement="$(cargo metadata --manifest-path "$packaged_crate/Cargo.toml" --locked --no-deps --format-version 1 | jq -r '.packages[0].dependencies[] | select(.name == "tokio") | .req')"
+cargo add --quiet "tokio@$tokio_requirement" --features io-util,macros,net,rt-multi-thread
 cargo add --quiet wat@=1.251.0
 CARGO_TARGET_DIR="$package_target" cargo run --locked --quiet
 

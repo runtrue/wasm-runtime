@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_string_pretty(&Report {
             schema: "runtrue-wasm-tier-benchmark-v1",
             runtime_version: env!("CARGO_PKG_VERSION"),
-            wasmtime_version: "46.0.1",
+            wasmtime_version: runtrue_wasm_runtime::WASMTIME_VERSION,
             host_os: std::env::consts::OS,
             host_arch: std::env::consts::ARCH,
             wasi,
