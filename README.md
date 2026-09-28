@@ -8,7 +8,7 @@ warmish, and warm execution tiers.
 | Status | `0.1` alpha |
 | Platform | Linux x86_64 |
 | Rust | 1.94 |
-| Wasmtime | 46.0.1 |
+| Wasmtime | 46.0.3 |
 | Primary WASI profile | 0.3 |
 | Compatibility profile | 0.2 |
 
