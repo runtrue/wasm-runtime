@@ -64,7 +64,7 @@ pub use wasix_worker::{WasixCheckpointRestoreMetadata, restore_wasix_checkpoint}
 pub use wasix_worker::{write_wasix_checkpoint_transport_probe, write_wasix_worker_probe};
 
 /// Exact Wasmtime release used to compile serialized artifacts.
-pub const WASMTIME_VERSION: &str = "46.0.1";
+pub const WASMTIME_VERSION: &str = "46.0.3";
 
 /// Primary WASI version supported by this release.
 pub const PRIMARY_WASI_VERSION: &str = "0.3.0";
