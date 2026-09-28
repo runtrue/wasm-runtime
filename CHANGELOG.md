@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6] - 2026-09-28
+
+### Added
+
+- Opt-in WASIX worker execution and authenticated checkpoint capture, transport,
+  and restore across isolated workers, with a checkpoint migration CI gate.
+
+### Changed
+
+- Update Tokio, Serde, serde_json, thiserror, and wit-component; regenerate the
+  WASI HTTP fixtures with the updated component encoder.
+- Refresh pinned GitHub Actions dependencies and keep the fuzz lockfile and
+  packaged-consumer checks compatible with runtime dependency updates.
+- Allow releases to use crates.io trusted publishing when no API key is set.
+
+
 ### Security
 
 - Update Wasmtime to 46.0.3 and patch h2 and rustls to resolve published
@@ -59,7 +75,8 @@ All notable changes to this project are documented here. The format follows
 - Direct-handler, TCP, capacity, cache eviction, timeout, and concurrent
   service benchmarks and tests.
 
-[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.5...HEAD
+[Unreleased]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.6...HEAD
+[0.1.0-alpha.6]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.5...v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.4...v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.3...v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/runtrue/wasm-runtime/compare/v0.1.0-alpha.2...v0.1.0-alpha.3

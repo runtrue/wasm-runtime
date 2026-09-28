@@ -65,7 +65,8 @@ isolated host reproduces them.
 
 ## Pinned comparison tools
 
-- Wasmtime CLI and embedding: 46.0.1
+- Wasmtime CLI: 46.0.1
+- Wasmtime embedding: 46.0.3
 - WASI HTTP 0.2 fixture: `wasip2` 1.0.4 / WASI HTTP 0.2.12
 - WASI HTTP 0.3 fixture: Wasmtime 46 WIT at `wasi:http@0.3.0`
 
