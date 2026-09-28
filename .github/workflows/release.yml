@@ -103,6 +103,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: release
+    env:
+      CRATES_APIKEY_CONFIGURED: ${{ secrets.CRATES_APIKEY != '' }}
     permissions:
       attestations: write
       contents: write
@@ -136,20 +138,15 @@ jobs:
               --title "runtrue-wasm-runtime $RELEASE_VERSION" --generate-notes
           fi
 
-      - name: Verify crates.io API key is configured
-        if: needs.build.outputs.publish_required == 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_APIKEY }}
-        run: |
-          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
-            echo "CRATES_APIKEY is not configured for the release environment" >&2
-            exit 1
-          fi
+      - name: Authenticate to crates.io with trusted publishing
+        if: needs.build.outputs.publish_required == 'true' && env.CRATES_APIKEY_CONFIGURED != 'true'
+        id: crates_io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish source package to crates.io
         if: needs.build.outputs.publish_required == 'true'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_APIKEY }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_APIKEY || steps.crates_io.outputs.token }}
         run: cargo publish --locked
 
       - name: Attest release bundle provenance
